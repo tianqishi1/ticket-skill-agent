@@ -1,0 +1,36 @@
+# ============================================================
+# SaaS 工单故障排查智能体 (LangGraph Demo) 依赖清单
+# 安装：pip install -r requirements.txt
+# 说明：本清单为依赖唯一来源，pyproject.toml 仅含工程元信息。
+# ============================================================
+
+# --- LangGraph 状态机 / DAG 工作流编排 ---
+# 含 interrupt() 人在回路 + MemorySaver 会话 checkpoint 能力
+langgraph>=0.2.40
+
+# --- LangChain 基础抽象与消息类型 ---
+langchain-core>=0.3.0
+
+# --- OpenAI 兼容 LLM 客户端（适配豆包 Seed API / Ark） ---
+langchain-openai>=0.2.0
+openai>=1.40.0
+
+# --- MCP 只读文件服务（FastMCP 服务端 + stdio 客户端） ---
+# 说明：mcp 2.x 已移除 fastmcp extra，FastMCP 现为独立包；
+# 故服务端用 `from fastmcp import FastMCP`，客户端用 `from mcp import ClientSession ...`。
+# 将 mcp 锁在 <2.0 以保证与 fastmcp 的协议互通及客户端 API 兼容。
+fastmcp>=3.0.0
+mcp>=1.29.0,<2.0.0
+
+# --- .env 环境变量管理 ---
+python-dotenv>=1.0.0
+
+# --- 数据校验（状态结构 / 结构化输出） ---
+pydantic>=2.0.0
+
+# --- RAG 知识库链路（轻量本地组件，不依赖 Elasticsearch / Milvus） ---
+# 说明：sentence-transformers 会拉取 CPU 版 torch（体积较大），
+# 首次构建向量库时会下载 all-MiniLM-L6-v2 与 cross-encoder 模型。
+chromadb>=0.5.0
+rank-bm25>=0.2.2
+sentence-transformers>=3.0.0
