@@ -2,28 +2,31 @@
 =========
 SaaS 工单故障排查智能体 —— LangGraph CLI 命令行入口。
 
-运行：python main.py
+运行：
+    python main.py                       # 进入交互循环（首次自动构建向量库）
+    python main.py --rebuild-vector      # 强制重建知识库向量库后进入循环
 
 交互流程
 --------
-1. 启动后打印横幅与配置自检结果；
-2. 进入交互循环，等待用户输入故障工单（多行，以一个空行结束输入）；
-   - 输入 `sample` 直接载入内置示例工单（晚高峰下单 504 场景）；
-   - 输入 `exit` 或 `quit` 退出；
-3. 执行 graph：
-   a. 工单解析 -> 评估数据源 -> 申请授权（graph 在此 interrupt 暂停）；
-   b. main.py 检测到挂起后打印授权申请，读取终端授权指令；
-   c. 用 Command(resume=<授权指令>) 恢复 graph -> 证据收集 -> 诊断 -> 报告；
-4. 打印最终 Markdown 故障报告；
-5. 回到步骤 2，等待下一个工单（每个工单独立 thread_id 隔离）。
+1. 启动后打印横幅与配置自检结果；必要时构建 / 重建知识库向量库；
+2. 进入交互循环，等待用户输入：
+   - 输入 `/diagnose ...` 或故障描述：进入故障排查流程；
+   - 输入普通文字：智能体做意图路由（可能反问确认意图）；
+   - 输入 `sample` 载入内置示例工单；输入 `exit`/`quit` 退出；
+3. 执行 graph：路由 → 工单解析 → 申请授权（interrupt）→ 证据收集（MCP+RAG）
+   → 诊断推理 → 报告 → 持久化；中途的 interrupt 由 main.py 统一处理；
+4. 打印最终 Markdown 故障报告与工单编号；
+5. 回到步骤 2，每个工单独立 thread_id 隔离。
 
 安全
 ----
-- 所有 LLM 不绑定工具，无法自动调用 MCP；
-- 授权指令只能由终端用户在 interrupt 暂停后输入，机制上保证「先授权后读取」。
+- 所有 LLM 不绑定工具，无法自动调用 MCP；RAG 同属 knowledge_base 数据源，
+  必须用户授权后才执行检索；
+- 授权 / 意图确认指令只能由终端用户在 interrupt 暂停后输入。
 """
 from __future__ import annotations
 
+import argparse
 import asyncio
 import os
 import sys
@@ -39,7 +42,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from agent.graph import build_graph  # noqa: E402
 
 # ---------------------------------------------------------------------------
-# 内置示例工单：晚高峰下单 504（缓存击穿 -> Hikari 打满）场景，便于一键演示
+# 内置示例工单：晚高峰下单 504（缓存击穿 -> Hikari 打满）场景
 # ---------------------------------------------------------------------------
 SAMPLE_TICKET = """【故障工单】晚高峰下单接口大面积 504
 时间：2026-08-20 20:01 起，持续约 3-5 分钟
@@ -72,6 +75,30 @@ def _enable_utf8_console() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 知识库向量库初始化（首次会下载嵌入模型；缺失依赖时优雅降级）
+# ---------------------------------------------------------------------------
+def _init_vector_store(rebuild: bool) -> None:
+    try:
+        from agent.rag import build_vector_store, vector_store_ready
+    except Exception as exc:  # noqa: BLE001
+        print(f"[警告] RAG 模块不可用（{exc}）；知识库检索将降级跳过。")
+        return
+    try:
+        if rebuild:
+            print("[初始化] 重建知识库向量库（首次会下载嵌入模型，请稍候）...")
+            n = build_vector_store(rebuild=True)
+            print(f"[初始化] 向量库重建完成，共 {n} 个 chunk。")
+        elif not vector_store_ready():
+            print("[初始化] 未检测到向量库，自动构建知识库向量库（首次会下载嵌入模型，请稍候）...")
+            n = build_vector_store(rebuild=False)
+            print(f"[初始化] 向量库构建完成，共 {n} 个 chunk。")
+        else:
+            print("[初始化] 知识库向量库已就绪。")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[警告] 向量库构建失败（{exc}）；故障排查时知识库检索将降级跳过。")
+
+
+# ---------------------------------------------------------------------------
 # 配置自检
 # ---------------------------------------------------------------------------
 def _self_check() -> None:
@@ -84,14 +111,16 @@ def _self_check() -> None:
     print(f"  MODEL_NAME : {model or '(未设置)'}")
     print(f"  BASE_URL   : {base_url or '(未设置)'}")
     print(f"  API_KEY    : {'已设置' if api_key and not api_key.startswith('your_') else '⚠️ 未设置或仍为占位符'}")
-    print("  数据源根目录：sample_data/、src/（仅只读）")
+    print("  数据源根目录：sample_data/、src/（仅只读，MCP 路径白盒校验）")
+    print("  意图路由：`/diagnose` 前缀硬路由；其余由 LLM 识别（低置信度会反问）")
     print("  提示：输入 `sample` 载入示例工单；输入 `exit` 退出。")
     print("=" * 64)
 
 
 def _read_ticket_input() -> str | None:
     """读取多行工单，以一个空行结束；返回 None 表示退出。"""
-    print("\n请输入故障工单（多行，输入一个空行结束输入）：", flush=True)
+    print("\n请输入（多行，输入一个空行结束输入）：", flush=True)
+    print("  · 输入 `/diagnose ...` 强制进入故障排查")
     print("  · 输入 `sample` 载入示例工单")
     print("  · 输入 `exit` 或 `quit` 退出")
     lines: list[str] = []
@@ -118,7 +147,7 @@ async def _await_input(prompt: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 单次工单完整执行（含 interrupt 人在回路）
+# 单次工单完整执行（含 interrupt 人在回路：统一处理路由反问 + 授权）
 # ---------------------------------------------------------------------------
 async def run_one_ticket(graph, ticket_text: str) -> None:
     thread_id = str(uuid.uuid4())
@@ -126,28 +155,34 @@ async def run_one_ticket(graph, ticket_text: str) -> None:
 
     init_state = {
         "user_ticket_input": ticket_text,
+        "intent": "",
+        "intent_confidence": 0.0,
         "parsed_ticket": {},
         "need_data_source_list": [],
+        "order_id": "",
         "user_allow_list": [],
         "user_deny_list": [],
         "evidence": {},
+        "rag_results": [],
+        "rag_low_score": False,
+        "session_memory": {},
+        "long_term_memory": [],
         "diagnosis_result": {},
         "final_report_markdown": "",
         "messages": [HumanMessage(content=ticket_text)],
     }
 
-    print("\n[1/5] 工单解析中...")
-    # 第一次推进：会跑到 request_authorize 节点处 interrupt 暂停
+    print("\n开始处理工单...")
+    # 第一次推进：会跑到首个 interrupt（路由反问 / 授权）或直接跑完（闲聊）
     await graph.ainvoke(init_state, config)
 
-    # 人在回路：处理授权 interrupt
+    # 人在回路：统一处理任意 interrupt（路由低置信度反问、数据源授权申请）
     while True:
         snapshot = graph.get_state(config)
         pending = []
         for task in snapshot.tasks:
             pending.extend(task.interrupts or [])
         if not pending:
-            # 无挂起中断：若仍有未执行节点则继续推进，否则结束
             if snapshot.next:
                 await graph.ainvoke(None, config)
                 continue
@@ -155,33 +190,40 @@ async def run_one_ticket(graph, ticket_text: str) -> None:
 
         intr = pending[0]
         payload = intr.value if isinstance(intr.value, dict) else {"prompt": str(intr.value)}
-        # 打印授权申请话术
-        print("\n" + "=" * 64)
-        print("[2/5] 申请数据源授权（人在回路）")
-        print("=" * 64)
-        print(payload.get("prompt", "请确认授权："))
-        user_input = await _await_input(
-            "\n请输入授权指令（例如「全部授权」/「1、2、5」/「全部拒绝」）: "
-        )
-        # 用用户输入恢复 graph：interrupt() 会返回该字符串
+        print("\n" + "-" * 64)
+        print("[人在回路 · 等待你的输入]")
+        print("-" * 64)
+        print(payload.get("prompt", "请确认："))
+        user_input = await _await_input("\n请输入: ")
         await graph.ainvoke(Command(resume=user_input), config)
 
-    print("\n[3-5/5] 证据收集 -> 诊断推理 -> 报告生成完成。")
     final = graph.get_state(config).values
     report = final.get("final_report_markdown", "（报告生成失败）")
+    order_id = final.get("order_id", "")
 
     print("\n" + "=" * 64)
-    print("【最终故障诊断报告】")
+    print("【最终输出】")
     print("=" * 64)
     print(report)
+    if order_id:
+        print(f"\n工单已持久化，编号：{order_id}")
 
 
 # ---------------------------------------------------------------------------
 # 主循环
 # ---------------------------------------------------------------------------
 async def main() -> None:
-    _enable_utf8_console()  # Windows 控制台 UTF-8，避免中文乱码
-    load_dotenv()  # 加载 .env
+    _enable_utf8_console()
+    load_dotenv()
+
+    parser = argparse.ArgumentParser(description="SaaS 工单故障排查智能体 (LangGraph Demo)")
+    parser.add_argument(
+        "--rebuild-vector", action="store_true",
+        help="强制重建知识库向量库（首次会下载嵌入模型）",
+    )
+    args = parser.parse_args()
+
+    _init_vector_store(rebuild=args.rebuild_vector)
     _self_check()
 
     graph = build_graph()
@@ -194,7 +236,7 @@ async def main() -> None:
         try:
             await run_one_ticket(graph, ticket)
         except Exception as exc:  # noqa: BLE001
-            print(f"\n[错误] 本轮工单执行失败：{exc}")
+            print(f"\n[错误] 本轮执行失败：{exc}")
             print("请检查 .env 配置 / 网络 / 模型可用性后重试。")
 
 

@@ -31,3 +31,7 @@ venv/
 .env
 .mypy_cache/
 .ruff_cache/
+
+# ---- LangGraph Demo 运行时生成物 ----
+langgraph_demo/vector_db/
+langgraph_demo/work_order_history/

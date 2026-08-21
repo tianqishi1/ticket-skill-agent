@@ -1,19 +1,23 @@
 """agent/nodes.py
 =================
-LangGraph 5 个业务节点实现 + MCP 只读客户端 + LLM 工厂 + 人在回路授权。
+LangGraph 业务节点实现 + MCP 只读客户端 + LLM 工厂 + 人在回路授权 + RAG 接入。
 
 节点清单
 --------
-1. parse_ticket_node            工单解析 Agent：解析工单 + 评估 need_data_source_list
-2. request_user_authorize_node  申请授权（interrupt 暂停等终端输入）→ 填充 allow/deny
-3. collect_evidence_node        仅对 allow_list 调用 MCP 只读工具收集证据
-4. diagnosis_reason_node        综合证据做根因推理（含置信度）
-5. generate_report_node         填充固定 Markdown 报告模板
+0. router_node                 意图路由（/diagnose 硬路由 或 LLM 识别，低置信度 interrupt 反问）
+1. chat_respond_node           闲聊 / 代码问答（不读本地文件）
+2. parse_ticket_node           工单解析 + 评估 need_data_source_list + 生成 order_id
+3. request_user_authorize_node 申请授权（interrupt 暂停等终端输入）→ 填充 allow/deny
+4. collect_evidence_node       仅对 allow_list 调用 MCP 只读工具 / 知识库走 RAG 检索
+5. diagnosis_reason_node       综合证据做根因推理（含置信度 + RAG 约束 + 长期记忆参考）
+6. generate_report_node        填充固定 Markdown 报告模板（含知识库引用来源）
+7. persist_work_order_node     序列化 state 关键内容到 work_order_history/<order_id>.json
 
 安全要点
 --------
 - LLM 不绑定任何工具，无法自动调用 MCP；MCP 工具仅在 collect_evidence_node 内
   对「已授权」数据源显式调用，从机制上保证「先授权后读取」；
+- RAG 检索同属 knowledge_base 数据源，必须用户授权后才执行，未授权直接跳过；
 - 修复建议在落报告前经 _sanitize_fix 兜底清洗，移除可直接运行的命令。
 """
 from __future__ import annotations
@@ -27,22 +31,23 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage
 
-from .prompts import DIAGNOSIS_PROMPT, PARSE_TICKET_PROMPT
+from .prompts import (
+    CHAT_PROMPT,
+    DIAGNOSIS_PROMPT,
+    PARSE_TICKET_PROMPT,
+    ROUTER_PROMPT,
+)
 from .state import TicketState
 
 # ---------------------------------------------------------------------------
 # 路径常量
-# 本文件位于 <repo_root>/langgraph_demo/agent/nodes.py
-# 因此 langgraph_demo 目录 = 上两级缺失一节，实际为 parent.parent（agent -> langgraph_demo）
-# repo_root = langgraph_demo 的上一级
 # ---------------------------------------------------------------------------
 LANGGRAPH_DEMO_DIR: Path = Path(__file__).resolve().parent.parent  # langgraph_demo/
-REPO_ROOT: Path = LANGGRAPH_DEMO_DIR.parent                         # ticket-skill-agent/
+REPO_ROOT: Path = LANGGRAPH_DEMO_DIR.parent                        # ticket-skill-agent/
 MCP_SERVER_PATH: Path = LANGGRAPH_DEMO_DIR / "mcp_file_server.py"
 
 # ---------------------------------------------------------------------------
 # 五类数据源定义：key -> (中文标签, 相对仓库根的访问基准目录)
-# 这 5 个 key 即 need_data_source_list / user_allow_list / user_deny_list 的取值
 # ---------------------------------------------------------------------------
 DATA_SOURCES: dict[str, dict[str, str]] = {
     "frontend":       {"label": "浏览器前端信息",     "base_dir": "sample_data/frontend_samples"},
@@ -61,7 +66,6 @@ MAX_FILES_PER_SOURCE = 10
 # ===========================================================================
 def get_llm():
     """根据 .env 配置返回 ChatOpenAI 实例。"""
-    # 延迟导入，避免在仅做语法检查等场景强依赖该库
     from langchain_openai import ChatOpenAI
 
     api_key = os.getenv("API_KEY")
@@ -80,10 +84,7 @@ def get_llm():
 
 
 def _extract_json(text: str) -> dict:
-    """从 LLM 输出中容错抽取 JSON 字典。
-
-    依次尝试：```json 代码块 -> ``` 代码块 -> 首个 { 到末个 } 子串。
-    """
+    """从 LLM 输出中容错抽取 JSON 字典。"""
     if not text:
         return {}
     m = re.search(r"```json\s*(\{.*?\})\s*```", text, re.S)
@@ -115,11 +116,7 @@ def _safe_get(d: dict, *keys, default: str = "用户未提供") -> str:
 # MCP 只读客户端：以 stdio 子进程拉起 mcp_file_server，调用 3 个只读工具
 # ===========================================================================
 class MCPFileClient:
-    """通过 stdio 连接独立 FastMCP 只读文件服务的客户端。
-
-    仅暴露 call() 方法调用 read_file / glob_list / grep_search 三个工具。
-    用作 collect_evidence_node 内的证据读取后端，用完即关。
-    """
+    """通过 stdio 连接独立 FastMCP 只读文件服务的客户端。"""
 
     def __init__(self) -> None:
         self._stdio_ctx = None
@@ -161,13 +158,94 @@ class MCPFileClient:
 
 
 # ===========================================================================
+# 节点 0：意图路由 Agent
+# ===========================================================================
+def _parse_intent_reply(reply: str) -> str:
+    """解析用户在「低置信度反问」中的回复 → troubleshoot | chat | code。"""
+    text = (reply or "").strip().lower()
+    if re.search(r"故障|排查|诊断|工单|diagnose|troubleshoot", text):
+        return "troubleshoot"
+    if re.search(r"代码|code", text):
+        return "code"
+    return "chat"
+
+
+async def router_node(state: TicketState) -> dict:
+    """意图路由：/diagnose 前缀硬路由；否则 LLM 识别；置信度 < 0.7 则 interrupt 反问。"""
+    from langgraph.types import interrupt
+
+    text = state.get("user_ticket_input", "")
+    stripped = text.lstrip()
+
+    if stripped.startswith("/diagnose"):
+        # 代码层硬路由：直接进入故障排查子图，不经过 LLM
+        intent, conf, reason = "troubleshoot", 1.0, "命中 /diagnose 前缀，代码硬路由"
+    else:
+        llm = get_llm()
+        resp = await llm.ainvoke([
+            {"role": "system", "content": ROUTER_PROMPT},
+            {"role": "user", "content": text[:2000]},
+        ])
+        raw = resp.content if isinstance(resp.content, str) else str(resp.content)
+        try:
+            data = _extract_json(raw)
+        except Exception:
+            data = {}
+        intent = str(data.get("intent", "chat")).lower()
+        if intent not in ("troubleshoot", "chat", "code"):
+            intent = "chat"
+        try:
+            conf = float(data.get("confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            conf = 0.0
+        reason = str(data.get("reason", ""))
+
+        # 低置信度 → 人在回路反问确认意图
+        if conf < 0.7:
+            prompt = (
+                f"意图识别置信度较低（{conf:.2f}）：{reason}\n"
+                "请确认你的意图：回复【故障排查】/【闲聊】/【代码】（默认按闲聊处理）。"
+            )
+            user_reply: str = interrupt({"prompt": prompt, "need_list": []})
+            intent = _parse_intent_reply(user_reply)
+            conf = 1.0
+            reason = f"用户已确认意图：{intent}"
+
+    msg = f"路由完成：意图={intent}，置信度={conf:.2f}（{reason}）。"
+    return {"intent": intent, "intent_confidence": conf, "messages": [AIMessage(content=msg)]}
+
+
+def route_after_router(state: TicketState) -> str:
+    """条件路由：troubleshoot → 故障排查子图；其余 → 闲聊应答。"""
+    return "troubleshoot" if state.get("intent") == "troubleshoot" else "chat"
+
+
+# ===========================================================================
+# 节点 chat：闲聊 / 代码问答（不读本地文件、不调用任何工具）
+# ===========================================================================
+async def chat_respond_node(state: TicketState) -> dict:
+    llm = get_llm()
+    text = state.get("user_ticket_input", "")
+    resp = await llm.ainvoke([
+        {"role": "system", "content": CHAT_PROMPT},
+        {"role": "user", "content": text[:4000]},
+    ])
+    content = resp.content if isinstance(resp.content, str) else str(resp.content)
+    return {
+        "final_report_markdown": content,
+        "messages": [AIMessage(content="闲聊 / 代码问答已回复。")],
+    }
+
+
+# ===========================================================================
 # 节点 1：工单解析 Agent
 # ===========================================================================
 async def parse_ticket_node(state: TicketState) -> dict:
-    """解析原始工单为结构化字典，并评估需要访问的数据源列表。"""
-    ticket_text = state["user_ticket_input"]
+    """解析原始工单为结构化字典，评估需要的数据源列表，并生成 order_id。"""
+    from .persistence import new_order_id
+
+    ticket_text = state.get("user_ticket_input", "")
     llm = get_llm()
-    # 用 HumanMessage 携带工单文本，system prompt 已设定输出 JSON
     resp = await llm.ainvoke([
         {"role": "system", "content": PARSE_TICKET_PROMPT},
         {"role": "user", "content": ticket_text},
@@ -177,7 +255,6 @@ async def parse_ticket_node(state: TicketState) -> dict:
     try:
         data = _extract_json(raw)
     except Exception:
-        # 解析失败时给出兜底，保证流程不中断
         data = {
             "parsed_ticket": {"phenomenon": ticket_text[:200]},
             "need_data_source_list": list(DATA_SOURCES.keys()),
@@ -185,21 +262,23 @@ async def parse_ticket_node(state: TicketState) -> dict:
 
     parsed_ticket = data.get("parsed_ticket", {}) or {}
     need_list = data.get("need_data_source_list", []) or []
-    # 清洗：只保留合法的数据源 key
     need_list = [k for k in need_list if k in DATA_SOURCES]
     if not need_list:
-        # 兜底：全部 5 类
         need_list = list(DATA_SOURCES.keys())
+
+    order_id = state.get("order_id") or new_order_id()
 
     summary = (
         f"工单解析完成：现象={_safe_get(parsed_ticket, 'phenomenon')}；"
         f"服务={_safe_get(parsed_ticket, 'service')}；"
-        f"关键词={_safe_get(parsed_ticket, 'keywords')}。"
+        f"关键词={_safe_get(parsed_ticket, 'keywords')}；"
+        f"工单编号={order_id}。"
         f"建议访问数据源：{[DATA_SOURCES[k]['label'] for k in need_list]}"
     )
     return {
         "parsed_ticket": parsed_ticket,
         "need_data_source_list": need_list,
+        "order_id": order_id,
         "messages": [AIMessage(content=summary)],
     }
 
@@ -208,10 +287,7 @@ async def parse_ticket_node(state: TicketState) -> dict:
 # 节点 2：申请授权（人在回路 interrupt）
 # ===========================================================================
 def _build_authorize_prompt(need_list: list[str]) -> str:
-    """构造与 Skill 版本一致的授权申请话术。"""
-    lines = [
-        "根据当前故障信息，为完成完整排查，我需要访问以下本地资源，请确认授权："
-    ]
+    lines = ["根据当前故障信息，为完成完整排查，我需要访问以下本地资源，请确认授权："]
     for i, key in enumerate(need_list, start=1):
         lines.append(f"{i}. [ ] 读取{DATA_SOURCES[key]['label']}")
     lines.append("")
@@ -223,13 +299,6 @@ def _build_authorize_prompt(need_list: list[str]) -> str:
 
 
 def _parse_authorization(user_input: str, need_list: list[str]) -> tuple[list[str], list[str]]:
-    """解析用户授权指令，返回 (allow_list, deny_list)。
-
-    支持：
-    - 全部授权 / all / 全部允许
-    - 全部拒绝 / none / 拒绝全部
-    - 序号：1、2、5 或 1 2 5 或 1,2,5
-    """
     text = (user_input or "").strip()
     if re.search(r"全部授权|全部允许|^\s*all\s*$|授权全部", text, re.I):
         allow = list(need_list)
@@ -237,27 +306,17 @@ def _parse_authorization(user_input: str, need_list: list[str]) -> tuple[list[st
         allow = []
     else:
         nums = [int(n) for n in re.findall(r"\d+", text)]
-        allow = [
-            need_list[i - 1] for i in nums if 1 <= i <= len(need_list)
-        ]
+        allow = [need_list[i - 1] for i in nums if 1 <= i <= len(need_list)]
     deny = [k for k in need_list if k not in allow]
     return allow, deny
 
 
 def request_user_authorize_node(state: TicketState) -> dict:
-    """输出需要授权的数据源，并 interrupt 暂停等待终端用户输入授权结果。
-
-    通过 langgraph interrupt() 暂停 graph：
-    - 暂停时把授权申请话术 + need_list 经 interrupt value 暴露给调用方（main.py）；
-    - main.py 读取终端输入后用 Command(resume=<用户输入>) 恢复；
-    - 恢复后 interrupt() 返回用户输入字符串，本节点据此填充 allow/deny。
-    """
-    from langgraph.types import interrupt  # 延迟导入，避免对纯静态检查强依赖
+    """输出需要授权的数据源，并 interrupt 暂停等待终端用户输入授权结果。"""
+    from langgraph.types import interrupt
 
     need_list = state.get("need_data_source_list", [])
     prompt = _build_authorize_prompt(need_list)
-
-    # 暂停 graph，把话术交给 main.py 打印；恢复时返回用户输入字符串
     user_input: str = interrupt({"prompt": prompt, "need_list": need_list})
 
     allow, deny = _parse_authorization(user_input, need_list)
@@ -273,81 +332,116 @@ def request_user_authorize_node(state: TicketState) -> dict:
 
 
 # ===========================================================================
-# 节点 3：证据收集 Agent（仅对已授权数据源调用 MCP 只读工具）
+# 节点 3：证据收集 Agent（仅对已授权数据源；知识库走 RAG）
 # ===========================================================================
 async def collect_evidence_node(state: TicketState) -> dict:
-    """对 user_allow_list 内每个数据源，调用 MCP 只读工具读取文件证据。
+    """对 user_allow_list 内每个数据源收集证据。
 
-    - 被拒绝的数据源直接跳过，不读取任何文件；
-    - 每个数据源最多读 MAX_FILES_PER_SOURCE 个文件；
-    - 证据存入 state["evidence"]，结构：{源key: [{"file_path", "content"}]}
+    - knowledge_base：走 RAG 检索（两路召回 + RRF + cross-encoder），返回 Top5 片段；
+    - 其余四类：调用 MCP 只读工具读取文件；
+    - 被拒绝的数据源直接跳过；
+    - 短期会话记忆缓存本轮 RAG 结果，避免重复检索。
     """
     allow_list = state.get("user_allow_list", [])
     deny_list = state.get("user_deny_list", [])
     evidence: dict[str, list[dict]] = {}
+    session_memory: dict = dict(state.get("session_memory", {}))
+    rag_results: list = list(state.get("rag_results", []))
+    rag_low_score: bool = bool(state.get("rag_low_score", False))
+    parsed = state.get("parsed_ticket", {}) or {}
 
     if not allow_list:
         return {
             "evidence": evidence,
+            "session_memory": session_memory,
             "messages": [AIMessage(content="无任何数据源被授权，跳过证据收集。")],
         }
 
-    # 用 grep 在源码中定位与故障相关的类/方法（仅当 code 被授权时）
-    keywords = _safe_get(state.get("parsed_ticket", {}), "keywords", default="")
-    service = _safe_get(state.get("parsed_ticket", {}), "service", default="")
+    # —— 知识库：RAG 检索（必须已授权）——
+    if "knowledge_base" in allow_list:
+        from .rag import build_rag_query, retrieve as rag_retrieve
+        query = session_memory.get("rag_query") or build_rag_query(parsed) or state.get("user_ticket_input", "")
+        rag_out = rag_retrieve(query)
+        session_memory["rag_query"] = query
+        session_memory["rag_result"] = rag_out
+        rag_results = rag_out.get("chunks", [])
+        rag_low_score = rag_out.get("low_score", True)
+        evidence["knowledge_base"] = [
+            {
+                "file_path": c.get("source", ""),
+                "content": c.get("text", ""),
+                "score": c.get("score"),
+                "section": c.get("section", ""),
+            }
+            for c in rag_results
+        ]
+        print(
+            f"  [证据] 故障知识库（RAG）：召回 {len(rag_results)} 个片段，"
+            f"best_score={rag_out.get('best_score')}，low_score={rag_low_score}",
+            file=sys.stderr,
+        )
 
-    async with MCPFileClient() as mcp:
-        for src in allow_list:
-            base_rel = DATA_SOURCES[src]["base_dir"]
-            base_abs = REPO_ROOT / base_rel
-            label = DATA_SOURCES[src]["label"]
+    # —— 其余四类：MCP 只读 ——
+    mcp_sources = [s for s in allow_list if s != "knowledge_base"]
+    keywords = _safe_get(parsed, "keywords", default="")
 
-            # 列出该数据源下全部文件
-            listing = await mcp.call("glob_list", base_dir=str(base_abs), pattern="**/*")
-            file_paths = [
-                REPO_ROOT / line.strip()
-                for line in listing.splitlines()
-                if line.strip() and not line.startswith("[")
-            ][:MAX_FILES_PER_SOURCE]
+    if mcp_sources:
+        async with MCPFileClient() as mcp:
+            for src in mcp_sources:
+                base_rel = DATA_SOURCES[src]["base_dir"]
+                base_abs = REPO_ROOT / base_rel
+                label = DATA_SOURCES[src]["label"]
 
-            collected: list[dict] = []
-            for fp in file_paths:
-                content = await mcp.call("read_file", file_path=str(fp))
-                collected.append({
-                    "file_path": str(fp.resolve().relative_to(REPO_ROOT.resolve())),
-                    "content": content,
-                })
+                listing = await mcp.call("glob_list", base_dir=str(base_abs), pattern="**/*")
+                file_paths = [
+                    REPO_ROOT / line.strip()
+                    for line in listing.splitlines()
+                    if line.strip() and not line.startswith("[")
+                ][:MAX_FILES_PER_SOURCE]
 
-            # 针对源码：额外用 grep 定位故障关键词所在行号（便于报告精确引用）
-            if src == "code" and keywords and keywords != "用户未提供":
+                collected: list[dict] = []
                 for fp in file_paths:
-                    grep_res = await mcp.call(
-                        "grep_search",
-                        pattern=re.escape(keywords),
-                        file_path=str(fp),
-                    )
-                    if not grep_res.startswith("[") and not grep_res.startswith("无匹配"):
-                        # 在对应文件证据里追加命中行信息
-                        for item in collected:
-                            if item["file_path"] == str(
-                                fp.resolve().relative_to(REPO_ROOT.resolve())
-                            ):
-                                item["grep_hits"] = grep_res
-                                break
+                    content = await mcp.call("read_file", file_path=str(fp))
+                    collected.append({
+                        "file_path": str(fp.resolve().relative_to(REPO_ROOT.resolve())),
+                        "content": content,
+                    })
 
-            evidence[src] = collected
-            print(f"  [证据] {label}：读取 {len(collected)} 个文件", file=sys.stderr)
+                # 源码额外 grep 定位关键词行号
+                if src == "code" and keywords and keywords != "用户未提供":
+                    for fp in file_paths:
+                        grep_res = await mcp.call(
+                            "grep_search", pattern=re.escape(keywords), file_path=str(fp)
+                        )
+                        if not grep_res.startswith("[") and not grep_res.startswith("无匹配"):
+                            rel = str(fp.resolve().relative_to(REPO_ROOT.resolve()))
+                            for item in collected:
+                                if item["file_path"] == rel:
+                                    item["grep_hits"] = grep_res
+                                    break
+
+                evidence[src] = collected
+                print(f"  [证据] {label}：读取 {len(collected)} 个文件", file=sys.stderr)
 
     denied_msg = (
         f"已跳过未授权数据源：{[DATA_SOURCES[k]['label'] for k in deny_list]}"
         if deny_list else ""
     )
-    msg = f"证据收集完成：已读取 {sum(len(v) for v in evidence.values())} 个文件。" + denied_msg
-    return {"evidence": evidence, "messages": [AIMessage(content=msg)]}
+    msg = (
+        f"证据收集完成：文件 {sum(len(v) for k, v in evidence.items() if k != 'knowledge_base')} 个"
+        f"+ 知识库 RAG 片段 {len(evidence.get('knowledge_base', []))} 个。"
+    ) + denied_msg
+    return {
+        "evidence": evidence,
+        "rag_results": rag_results,
+        "rag_low_score": rag_low_score,
+        "session_memory": session_memory,
+        "messages": [AIMessage(content=msg)],
+    }
 
 
 # ===========================================================================
-# 节点 4：故障诊断推理 Agent
+# 节点 4：故障诊断推理 Agent（含 RAG 约束 + 长期记忆参考）
 # ===========================================================================
 def _build_evidence_context(state: TicketState) -> str:
     """把 state 内全部证据拼成 LLM 可读的上下文文本。"""
@@ -368,9 +462,9 @@ def _build_evidence_context(state: TicketState) -> str:
             label = DATA_SOURCES.get(src, {}).get("label", src)
             parts.append(f"--- 来源：{label} ---")
             for item in files:
-                parts.append(f">>> 文件：{item['file_path']}")
+                parts.append(f">>> 文件：{item['file_path']}"
+                             + (f"（score={item.get('score')}）" if item.get("score") is not None else ""))
                 content = item.get("content", "")
-                # 截断过长内容，避免上下文爆炸
                 parts.append(content[:4000])
                 if item.get("grep_hits"):
                     parts.append(f"(grep 命中行：)\n{item['grep_hits']}")
@@ -378,11 +472,32 @@ def _build_evidence_context(state: TicketState) -> str:
     else:
         parts.append("【已授权读取的文件证据】无（用户未授权任何数据源）")
 
+    # 知识库 RAG 低分提示
+    if state.get("rag_low_score") and "knowledge_base" in (state.get("user_allow_list", [])):
+        parts.append("【知识库检索提示】相关性分数过低：知识库无高相关性匹配案例，不得编造历史案例。")
+        parts.append("")
+
     deny_list = state.get("user_deny_list", [])
     if deny_list:
-        parts.append("")
         parts.append("【未授权、未参与分析的数据源】")
         parts.append("、".join(DATA_SOURCES[k]["label"] for k in deny_list))
+        parts.append("")
+
+    # 长期记忆参考（仅提示，禁止复用根因）
+    try:
+        from .persistence import load_long_term_memory
+        history = load_long_term_memory(limit=5)
+    except Exception:  # noqa: BLE001
+        history = []
+    if history:
+        parts.append("【历史工单记忆（仅供参考，禁止直接复用历史根因结论）】")
+        for h in history:
+            parts.append(
+                f"- {h.get('order_id','')} | {h.get('service','')} | "
+                f"{h.get('phenomenon','')[:80]} | 置信度={h.get('confidence','')}"
+            )
+        parts.append("")
+
     return "\n".join(parts)
 
 
@@ -399,7 +514,6 @@ async def diagnosis_reason_node(state: TicketState) -> dict:
     try:
         data = _extract_json(raw)
     except Exception:
-        # 兜底：置信度低，提示证据不足
         data = {
             "confidence": "低",
             "root_cause_analysis": "诊断模型输出解析失败，无法给出可靠结论，请补充更多故障信息或开放更多授权。",
@@ -409,21 +523,20 @@ async def diagnosis_reason_node(state: TicketState) -> dict:
             "evidence_sources": ["用户输入"],
         }
 
-    # 兜底补齐缺失字段
     data.setdefault("confidence", "低")
     for k in ("root_cause_analysis", "reproduce_verification",
               "fix_suggestions", "prevention_suggestions"):
         data.setdefault(k, "证据不足，暂无法给出结论。")
     data.setdefault("evidence_sources", ["用户输入"])
-
-    # 清洗修复建议：移除可直接运行的命令，强制前置人工执行标识
     data["fix_suggestions"] = _sanitize_fix(data["fix_suggestions"])
 
     msg = f"诊断推理完成，置信度：{data.get('confidence')}。"
     return {"diagnosis_result": data, "messages": [AIMessage(content=msg)]}
 
 
-# 直接可运行命令的兜底黑名单（仅清洗修复建议，不做任何执行）
+# ===========================================================================
+# 修复建议兜底清洗
+# ===========================================================================
 _RUNNABLE_PREFIXES = (
     "rm ", "rm -", "mv ", "cp ", "chmod", "chown", "curl ", "wget ",
     "redis-cli", "mysql ", "psql ", "ssh ", "scp ", "kill ", "killall",
@@ -433,10 +546,7 @@ _RUNNABLE_PREFIXES = (
 
 
 def _sanitize_fix(text: str) -> str:
-    """兜底清洗修复建议：把疑似可直接运行的命令行改为自然语言意图描述。
-
-    这是对「prompt 禁止输出可运行命令」的代码层二次保险。
-    """
+    """把疑似可直接运行的命令行改为自然语言意图描述（代码层二次保险）。"""
     if not text:
         return "⚠️【需人工执行】证据不足，暂无修复建议。"
     out_lines: list[str] = []
@@ -449,7 +559,6 @@ def _sanitize_fix(text: str) -> str:
             )
         else:
             out_lines.append(line)
-    # 确保整体前置人工执行标识存在
     joined = "\n".join(out_lines).strip()
     if "⚠️【需人工执行】" not in joined:
         joined = "⚠️【需人工执行】\n" + joined
@@ -457,11 +566,12 @@ def _sanitize_fix(text: str) -> str:
 
 
 # ===========================================================================
-# 节点 5：报告生成 Agent（填充固定 Markdown 模板，与 Skill 版本完全一致）
+# 节点 5：报告生成 Agent（固定 Markdown 模板 + 知识库引用来源）
 # ===========================================================================
 REPORT_TEMPLATE = """# 故障诊断报告
 
 ## 1. 故障概览
+工单编号：{order_id}
 故障现象：{phenomenon}
 故障客户端：{client}
 涉及服务：{service}
@@ -480,6 +590,9 @@ REPORT_TEMPLATE = """# 故障诊断报告
 
 > 已授权读取的文件证据：
 {evidence_summary}
+
+> 知识库检索（RAG）匹配案例：
+{rag_summary}
 
 ## 4. 疑似根因分析（置信度：{confidence}）
 {root_cause_analysis}
@@ -502,24 +615,53 @@ REPORT_TEMPLATE = """# 故障诊断报告
 
 
 def _format_evidence_summary(evidence: dict) -> str:
-    """把证据字典格式化为报告第 3 节的文件证据文本。"""
+    """文件证据文本（知识库 RAG 单独展示，此处跳过 knowledge_base）。"""
     if not evidence:
         return "（无已授权读取的文件证据）"
     parts: list[str] = []
     for src, files in evidence.items():
+        if src == "knowledge_base":
+            continue  # RAG 单独成段
         label = DATA_SOURCES.get(src, {}).get("label", src)
         parts.append(f"【{label}】")
         for item in files:
             parts.append(f"  - {item['file_path']}")
-            content = item.get("content", "")
-            excerpt = content[:1200]
-            # 缩进展示，避免破坏 Markdown 结构
+            excerpt = item.get("content", "")[:1200]
             parts.append("    " + excerpt.replace("\n", "\n    "))
             if item.get("grep_hits"):
                 parts.append("    (关键词命中行：)")
                 parts.append("    " + str(item["grep_hits"]).replace("\n", "\n    "))
             parts.append("")
-    return "\n".join(parts).strip()
+    return "\n".join(parts).strip() or "（无已授权读取的文件证据）"
+
+
+def _format_rag_summary(state: TicketState) -> str:
+    """知识库 RAG 匹配案例文本（含来源 + 相关性分数，用于报告溯源）。"""
+    allow_list = state.get("user_allow_list", [])
+    if "knowledge_base" not in allow_list:
+        return "（知识库未获得授权，未执行 RAG 检索）"
+
+    rag_low = state.get("rag_low_score", False)
+    chunks = state.get("rag_results", []) or []
+    if rag_low and not chunks:
+        return "（检索相关性过低：知识库无高相关性匹配案例，未返回片段）"
+    if not chunks:
+        return "（RAG 检索未返回结果）"
+    if rag_low:
+        return (
+            f"（检索相关性过低：best_score 过低，知识库无高相关性匹配案例；"
+            f"以下为参考片段，请谨慎采纳）\n"
+            + "\n".join(
+                f"- {c.get('source','')}（score={c.get('score')}）："
+                f"{(c.get('text','') or '')[:200].replace(chr(10),' ')}"
+                for c in chunks
+            )
+        )
+    return "\n".join(
+        f"- {c.get('source','')}（score={c.get('score')}）："
+        f"{(c.get('text','') or '')[:200].replace(chr(10),' ')}"
+        for c in chunks
+    )
 
 
 def generate_report_node(state: TicketState) -> dict:
@@ -544,6 +686,7 @@ def generate_report_node(state: TicketState) -> dict:
     )
 
     report = REPORT_TEMPLATE.format(
+        order_id=state.get("order_id", "（未生成）"),
         phenomenon=_safe_get(parsed, "phenomenon"),
         client=_safe_get(parsed, "client"),
         service=_safe_get(parsed, "service"),
@@ -553,6 +696,7 @@ def generate_report_node(state: TicketState) -> dict:
         denied_summary=denied_summary,
         user_input_summary=state.get("user_ticket_input", "（用户未提供）"),
         evidence_summary=_format_evidence_summary(evidence),
+        rag_summary=_format_rag_summary(state),
         confidence=diag.get("confidence", "低"),
         root_cause_analysis=diag.get("root_cause_analysis", "证据不足，暂无法给出结论。"),
         reproduce_verification=diag.get("reproduce_verification", "证据不足，暂无法给出结论。"),
@@ -564,4 +708,17 @@ def generate_report_node(state: TicketState) -> dict:
     return {
         "final_report_markdown": report,
         "messages": [AIMessage(content="故障诊断报告已生成。")],
+    }
+
+
+# ===========================================================================
+# 节点 6：工单持久化（序列化 state 关键内容 + 追加长期记忆）
+# ===========================================================================
+def persist_work_order_node(state: TicketState) -> dict:
+    """把本次诊断 state 关键内容序列化为 JSON 落盘，返回 order_id。"""
+    from .persistence import save_work_order
+    order_id = save_work_order(state)
+    return {
+        "order_id": order_id,
+        "messages": [AIMessage(content=f"工单已持久化：{order_id}")],
     }
