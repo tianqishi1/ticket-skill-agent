@@ -1,0 +1,58 @@
+====================================================================
+【样例1】浏览器控制台报错 + 接口响应报文（用户 zhangsan@tenant888，2026-08-20 20:01:15）
+====================================================================
+Chrome Console:
+  [ERROR] POST https://app.example.com/api/order/create 504 (Gateway Timeout)
+  OrderSubmit.vue:312 Uncaught (in promise) Error: 下单失败，请稍后重试
+      at handleSubmit (OrderSubmit.vue:312:15)
+  Network:
+    Request URL:    https://app.example.com/api/order/create
+    Request Method: POST
+    Status Code:    504 Gateway Timeout
+    Remote Address: 120.x.x.x:443
+    TraceId（响应头）: x-trace-id=abc123def456
+    X-Tenant-Id:    888
+
+Request Payload:
+{
+  "userId": 10086,
+  "tenantId": 888,
+  "items": [
+    {"skuId": "SKU-A-001", "count": 2, "price": 29900},
+    {"skuId": "SKU-B-005", "count": 1, "price": 19900}
+  ],
+  "couponId": null,
+  "addressId": 7001
+}
+
+Response Body:
+<html>
+<head><title>504 Gateway Timeout</title></head>
+<body>
+<center><h1>504 Gateway Timeout</h1></center>
+<hr><center>nginx/1.24.0</center>
+</body>
+</html>
+
+====================================================================
+【样例2】同一租户 lisi@tenant888 的下单 504 （2026-08-20 20:01:15）
+====================================================================
+TraceId: x-trace-id=def789ghi012
+X-Tenant-Id: 888
+Response: 同样的 nginx 504 HTML 页面
+
+====================================================================
+【样例3】另一租户 wangwu@tenant666 的下单 504 （2026-08-20 20:01:15）
+====================================================================
+TraceId: x-trace-id=jkl901mno234
+X-Tenant-Id: 666
+Response: 同样的 nginx 504 HTML 页面
+
+====================================================================
+【样例4】20:05 后 tenant999 用户下单成功（对照组）
+====================================================================
+Chrome Network:
+  POST /api/order/create 200 OK (22ms)
+  x-trace-id: aaa555bbb888
+  x-tenant-id: 999
+  Response: { "code":0, "data":{"orderNo":"SO20260820123456"} }

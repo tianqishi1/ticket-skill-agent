@@ -1,0 +1,30 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: order-service
+  datasource:
+    url: jdbc:mysql://order-db:3306/order_db?useUnicode=true&characterEncoding=utf8
+    username: app_order
+    password: ${MYSQL_PWD}
+    # 订单库 Hikari 连接池（问题场景中被打满）
+    hikari:
+      maximum-pool-size: 50       # 小了，高峰期 DB 查询慢时会被占满
+      minimum-idle: 10
+      connection-timeout: 30000   # 30s 拿不到连接就抛 SQLTransientConnectionException
+      idle-timeout: 600000
+      max-lifetime: 1800000
+  redis:
+    host: cache.example.com
+    port: 6379
+    timeout: 500ms
+    lettuce:
+      pool:
+        max-active: 200
+        max-idle: 50
+
+# 网关超时（在 gateway 配置，这里留注释作为证据对照）
+# gateway: routes.uri=http://order-service:8080 routes.timeout=3s
+# 当订单链路 > 3s，nginx/gateway 直接返回 504 给前端
+# 而 Hikari 拿连接需要等 30s，所以排队中的请求几乎都会触发 504

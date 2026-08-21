@@ -1,0 +1,12 @@
+2026-08-20 20:00:01.000 INFO  [gateway]  [traceId=xxx0001] REQ  POST /api/order/create -> order-service, tenantId=101, status=200, cost=256ms
+2026-08-20 20:00:01.080 INFO  [gateway]  [traceId=xxx0002] REQ  POST /api/order/create -> order-service, tenantId=202, status=200, cost=210ms
+2026-08-20 20:01:12.300 INFO  [gateway]  [traceId=abc123def456] REQ  POST /api/order/create -> order-service, tenantId=888
+2026-08-20 20:01:15.301 ERROR [gateway]  [traceId=abc123def456] RESP POST /api/order/create - 504 Gateway Timeout, upstream=order-service:8080, timeout=3000ms, waited=3000ms
+2026-08-20 20:01:12.310 INFO  [gateway]  [traceId=def789ghi012] REQ  POST /api/order/create -> order-service, tenantId=888
+2026-08-20 20:01:15.311 ERROR [gateway]  [traceId=def789ghi012] RESP POST /api/order/create - 504 Gateway Timeout, upstream=order-service:8080, timeout=3000ms, waited=3000ms
+2026-08-20 20:01:12.320 INFO  [gateway]  [traceId=ghi345jkl678] REQ  POST /api/order/create -> order-service, tenantId=888
+2026-08-20 20:01:15.322 ERROR [gateway]  [traceId=ghi345jkl678] RESP POST /api/order/create - 504 Gateway Timeout, upstream=order-service:8080, timeout=3000ms, waited=3000ms
+2026-08-20 20:01:12.330 INFO  [gateway]  [traceId=jkl901mno234] REQ  POST /api/order/create -> order-service, tenantId=666
+2026-08-20 20:01:15.335 ERROR [gateway]  [traceId=jkl901mno234] RESP POST /api/order/create - 504 Gateway Timeout, upstream=order-service:8080, timeout=3000ms, waited=3000ms
+2026-08-20 20:05:00.410 INFO  [gateway]  [traceId=aaa555bbb888] REQ  POST /api/order/create -> order-service, tenantId=999, status=200, cost=22ms
+2026-08-20 20:10:00.100 INFO  [gateway]  [traceId=zzz0001] REQ  POST /api/order/create -> order-service, tenantId=888, status=200, cost=412ms
