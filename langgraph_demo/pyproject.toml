@@ -1,0 +1,20 @@
+# ============================================================
+# 工程元信息（仅元数据，依赖请见 requirements.txt）
+# 这样避免两处维护依赖导致版本漂移。
+# ============================================================
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ticket-troubleshooting-langgraph"
+version = "0.1.0"
+description = "SaaS 工单故障排查只读智能体 —— LangGraph 独立可运行 Demo（人在回路 + FastMCP 只读文件服务）"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+# 注意：运行时依赖统一在 requirements.txt 中声明，此处不重复列出。
+dependencies = []
+
+[tool.setuptools]
+packages = ["agent"]
