@@ -1,0 +1,31 @@
+2026-08-20 20:01:12.301 INFO  [order-service] [http-nio-8080-exec-45] [traceId=abc123def456,tenantId=888] o.c.o.OrderController  - createOrder start, userId=10086, skuCount=3
+2026-08-20 20:01:12.315 INFO  [order-service] [http-nio-8080-exec-45] [traceId=abc123def456,tenantId=888] o.c.o.c.CouponService     - getAvailableCoupons cache MISS, tenantId=888, key=coupons:available:888
+2026-08-20 20:01:12.318 INFO  [order-service] [http-nio-8080-exec-78] [traceId=def789ghi012,tenantId=888] o.c.o.c.CouponService     - getAvailableCoupons cache MISS, tenantId=888, key=coupons:available:888
+2026-08-20 20:01:12.322 INFO  [order-service] [http-nio-8080-exec-31] [traceId=ghi345jkl678,tenantId=888] o.c.o.c.CouponService     - getAvailableCoupons cache MISS, tenantId=888, key=coupons:available:888
+2026-08-20 20:01:12.329 INFO  [order-service] [http-nio-8080-exec-12] [traceId=jkl901mno234,tenantId=666] o.c.o.c.CouponService     - getAvailableCoupons cache MISS, tenantId=666, key=coupons:available:666
+2026-08-20 20:01:42.402 ERROR [order-service] [http-nio-8080-exec-45] [traceId=abc123def456,tenantId=888] o.c.o.OrderController  - createOrder failed
+org.springframework.dao.CannotGetJdbcConnectionException: Failed to obtain JDBC Connection; nested exception is java.sql.SQLTransientConnectionException: HikariPool-1 - Connection is not available, request timed out after 30000ms.
+	at org.springframework.jdbc.datasource.DataSourceUtils.getConnection(DataSourceUtils.java:83)
+	at org.springframework.jdbc.core.JdbcTemplate.execute(JdbcTemplate.java:372)
+	at org.springframework.jdbc.core.JdbcTemplate.query(JdbcTemplate.java:453)
+	at com.example.order.coupon.CouponService.queryCouponsFromDB(CouponService.java:118)
+	at com.example.order.coupon.CouponService.getAvailableCoupons(CouponService.java:67)
+	at com.example.order.OrderController.createOrder(OrderController.java:89)
+	at sun.reflect.GeneratedMethodAccessor123.invoke(Unknown Source)
+	...
+Caused by: java.sql.SQLTransientConnectionException: HikariPool-1 - Connection is not available, request timed out after 30000ms.
+	at com.zaxxer.hikari.pool.HikariPool.createTimeoutException(HikariPool.java:696)
+	at com.zaxxer.hikari.pool.HikariPool.getConnection(HikariPool.java:197)
+	at com.zaxxer.hikari.HikariDataSource.getConnection(HikariDataSource.java:128)
+	at org.springframework.jdbc.datasource.DataSourceUtils.fetchConnection(DataSourceUtils.java:159)
+	... 60 common frames omitted
+
+2026-08-20 20:01:42.500 ERROR [order-service] [http-nio-8080-exec-78] [traceId=def789ghi012,tenantId=888] o.c.o.OrderController  - createOrder failed
+org.springframework.dao.CannotGetJdbcConnectionException: Failed to obtain JDBC Connection; nested exception is java.sql.SQLTransientConnectionException: HikariPool-1 - Connection is not available, request timed out after 30000ms.
+	at com.example.order.coupon.CouponService.queryCouponsFromDB(CouponService.java:118)
+	...
+2026-08-20 20:01:42.588 ERROR [order-service] [http-nio-8080-exec-31] [traceId=ghi345jkl678,tenantId=888] o.c.o.OrderController  - createOrder failed, same HikariPool timeout
+2026-08-20 20:02:15.001 WARN  [order-service] [HikariPool-1 housekeeper] [traceId=-] com.zaxxer.hikari.pool.HikariPool - HikariPool-1 - Pool stats (total=50, active=50, idle=0, waiting=287)
+2026-08-20 20:05:00.412 INFO  [order-service] [http-nio-8080-exec-22] [traceId=aaa555bbb888,tenantId=999] o.c.o.c.CouponService     - getAvailableCoupons cache HIT, tenantId=999
+2026-08-20 20:05:00.430 INFO  [order-service] [http-nio-8080-exec-22] [traceId=aaa555bbb888,tenantId=999] o.c.o.OrderController  - createOrder success, orderNo=SO20260820123456, cost=18ms
+2026-08-20 20:15:32.010 WARN  [order-service] [HikariPool-1 housekeeper] [traceId=-] com.zaxxer.hikari.pool.HikariPool - HikariPool-1 - Pool stats (total=50, active=12, idle=38, waiting=0)
