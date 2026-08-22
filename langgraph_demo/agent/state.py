@@ -7,6 +7,7 @@ LangGraph Graph State 状态结构体定义。
 
 字段说明
 --------
+- tenant_id               : 租户标识（工程边界：所有外部查询强制带 tenant，缺失退化为 default）
 - user_ticket_input        : 用户原始工单输入（故障描述 / 报错 / 堆栈 / 接口报文）
 - messages                 : LangGraph 标准消息列表（用 add_messages reducer 累加）
 
@@ -29,6 +30,9 @@ LangGraph Graph State 状态结构体定义。
 
 - diagnosis_result         : 诊断推理节点输出的根因/置信度/修复建议等结构化结果
 - final_report_markdown    : 报告生成节点填充固定模板后的最终 Markdown 报告
+
+- degrade_notes            : 工程边界降级记录（LLM/工具/Milvus/MySQL 失败时的降级说明，入报告）
+- call_count               : 本轮 LLM 调用次数（限流/复盘用，进程内统计）
 """
 from __future__ import annotations
 
@@ -42,6 +46,7 @@ class TicketState(TypedDict):
     """工单故障排查 DAG 的共享状态结构体。"""
 
     # —— 输入 ——
+    tenant_id: str
     user_ticket_input: str
     messages: Annotated[list[BaseMessage], add_messages]
 
@@ -70,3 +75,7 @@ class TicketState(TypedDict):
     # —— 诊断推理 / 报告阶段输出 ——
     diagnosis_result: dict
     final_report_markdown: str
+
+    # —— 工程边界 ——
+    degrade_notes: list
+    call_count: int

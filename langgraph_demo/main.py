@@ -101,7 +101,9 @@ def _init_vector_store(rebuild: bool) -> None:
 # ---------------------------------------------------------------------------
 # 配置自检
 # ---------------------------------------------------------------------------
-def _self_check() -> None:
+def _self_check(tenant_id: str = "") -> None:
+    from agent.infra import infra_status, resolve_tenant
+
     print("=" * 64)
     print("SaaS 工单故障排查智能体 (LangGraph Demo)")
     print("=" * 64)
@@ -111,8 +113,14 @@ def _self_check() -> None:
     print(f"  MODEL_NAME : {model or '(未设置)'}")
     print(f"  BASE_URL   : {base_url or '(未设置)'}")
     print(f"  API_KEY    : {'已设置' if api_key and not api_key.startswith('your_') else '⚠️ 未设置或仍为占位符'}")
+    print(f"  TENANT_ID  : {resolve_tenant(tenant_id)}")
+    st = infra_status()
+    print(f"  基础设施   : Milvus={'✓' if st['milvus'] else '✗(RAG降级)'} "
+          f"MySQL={'✓' if st['mysql'] else '✗(JSON降级)'} "
+          f"Redis={'✓' if st['redis'] else '✗(进程内限流)'}")
     print("  数据源根目录：sample_data/、src/（仅只读，MCP 路径白盒校验）")
     print("  意图路由：`/diagnose` 前缀硬路由；其余由 LLM 识别（低置信度会反问）")
+    print("  工程边界：LLM 限流/超时/重试/日志 + 节点级降级 + 租户隔离")
     print("  提示：输入 `sample` 载入示例工单；输入 `exit` 退出。")
     print("=" * 64)
 
@@ -149,11 +157,12 @@ async def _await_input(prompt: str) -> str:
 # ---------------------------------------------------------------------------
 # 单次工单完整执行（含 interrupt 人在回路：统一处理路由反问 + 授权）
 # ---------------------------------------------------------------------------
-async def run_one_ticket(graph, ticket_text: str) -> None:
+async def run_one_ticket(graph, ticket_text: str, tenant_id: str = "") -> None:
     thread_id = str(uuid.uuid4())
     config = {"configurable": {"thread_id": thread_id}}
 
     init_state = {
+        "tenant_id": tenant_id,
         "user_ticket_input": ticket_text,
         "intent": "",
         "intent_confidence": 0.0,
@@ -169,6 +178,8 @@ async def run_one_ticket(graph, ticket_text: str) -> None:
         "long_term_memory": [],
         "diagnosis_result": {},
         "final_report_markdown": "",
+        "degrade_notes": [],
+        "call_count": 0,
         "messages": [HumanMessage(content=ticket_text)],
     }
 
@@ -221,10 +232,15 @@ async def main() -> None:
         "--rebuild-vector", action="store_true",
         help="强制重建知识库向量库（首次会下载嵌入模型）",
     )
+    parser.add_argument(
+        "--tenant", default=os.getenv("TENANT_ID", ""),
+        help="租户标识（工程边界：所有查询强制带 tenant；默认读 TENANT_ID 环境变量）",
+    )
     args = parser.parse_args()
+    tenant = args.tenant or os.getenv("TENANT_ID", "")
 
     _init_vector_store(rebuild=args.rebuild_vector)
-    _self_check()
+    _self_check(tenant_id=tenant)
 
     graph = build_graph()
 
@@ -234,7 +250,7 @@ async def main() -> None:
             print("已退出。")
             break
         try:
-            await run_one_ticket(graph, ticket)
+            await run_one_ticket(graph, ticket, tenant_id=tenant)
         except Exception as exc:  # noqa: BLE001
             print(f"\n[错误] 本轮执行失败：{exc}")
             print("请检查 .env 配置 / 网络 / 模型可用性后重试。")

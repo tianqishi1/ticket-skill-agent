@@ -10,8 +10,17 @@ LangGraph 业务节点实现 + MCP 只读客户端 + LLM 工厂 + 人在回路�
 3. request_user_authorize_node 申请授权（interrupt 暂停等终端输入）→ 填充 allow/deny
 4. collect_evidence_node       仅对 allow_list 调用 MCP 只读工具 / 知识库走 RAG 检索
 5. diagnosis_reason_node       综合证据做根因推理（含置信度 + RAG 约束 + 长期记忆参考）
-6. generate_report_node        填充固定 Markdown 报告模板（含知识库引用来源）
-7. persist_work_order_node     序列化 state 关键内容到 work_order_history/<order_id>.json
+6. generate_report_node        填充固定 Markdown 报告模板（含知识库引用来源 + 租户 + 降级说明）
+7. persist_work_order_node     序列化 state 关键内容（MySQL 优先，失败降级 JSON）
+
+工程边界（对应「补齐工程边界」需求）
+---------------------------------
+- 租户隔离：所有外部查询（MCP / RAG / 持久化）强制带 tenant_id（infra.resolve_tenant）；
+- 超时 + 重试：LLM 走 _invoke_llm（限流 → with_retry 超时退避 → 日志），
+  MCP 走 MCPFileClient.call（超时 + 重试 + 日志）；
+- 限流：infra.llm_rate_allowed 按 tenant 维度计数（Redis 优先，进程内退化）；
+- 异常降级：每个节点 try/except 包裹，失败写 degrade_notes 并返回降级结果，绝不抛堆栈中断主流程；
+- 调用日志：infra.log_call 记录 prompt / 工具入参出参 / token 消耗，写 logs/calls.jsonl。
 
 安全要点
 --------
@@ -31,6 +40,13 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage
 
+from .infra import (
+    extract_tokens,
+    llm_rate_allowed,
+    log_call,
+    resolve_tenant,
+    with_retry,
+)
 from .prompts import (
     CHAT_PROMPT,
     DIAGNOSIS_PROMPT,
@@ -65,7 +81,7 @@ MAX_FILES_PER_SOURCE = 10
 # LLM 工厂：读取 .env，构造 OpenAI 兼容客户端（适配豆包 Seed / Ark）
 # ===========================================================================
 def get_llm():
-    """根据 .env 配置返回 ChatOpenAI 实例。"""
+    """根据 .env 配置返回 ChatOpenAI 实例（含超时 + max_retries）。"""
     from langchain_openai import ChatOpenAI
 
     api_key = os.getenv("API_KEY")
@@ -80,7 +96,54 @@ def get_llm():
         api_key=api_key,
         temperature=0.2,
         timeout=timeout,
+        max_retries=int(os.getenv("LLM_MAX_RETRIES", "2")),
     )
+
+
+def _messages_to_text(messages) -> str:
+    """把消息列表渲染成可记入日志的文本（role + content）。"""
+    parts: list[str] = []
+    for m in messages:
+        if isinstance(m, dict):
+            parts.append(f"[{m.get('role', '?')}] {m.get('content', '')}")
+        else:
+            role = getattr(m, "type", getattr(m, "role", "?"))
+            parts.append(f"[{role}] {getattr(m, 'content', '')}")
+    return "\n".join(parts)
+
+
+async def _invoke_llm(messages, *, tenant_id: str, component: str):
+    """统一 LLM 调用入口：限流 → 超时+重试 → 调用日志。失败抛异常由节点降级捕获。
+
+    工程边界闭环：限流防打爆、超时重试防抖动、日志留痕可复盘。
+    """
+    ok, reason = llm_rate_allowed(tenant_id)
+    if not ok:
+        log_call(component, tenant_id=tenant_id, error=reason)
+        raise RuntimeError(reason)
+    llm = get_llm()
+    timeout = int(os.getenv("LLM_TIMEOUT", "60"))
+    prompt_text = _messages_to_text(messages)
+
+    async def _do():
+        return await llm.ainvoke(messages)
+
+    try:
+        resp = await with_retry(
+            _do,
+            retries=int(os.getenv("LLM_MAX_RETRIES", "2")),
+            base_delay=1.5,
+            timeout=timeout,
+            label=component,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log_call(component, tenant_id=tenant_id, prompt=prompt_text, error=str(exc))
+        raise
+    tokens = extract_tokens(resp)
+    content = resp.content if isinstance(resp.content, str) else str(resp.content)
+    log_call(component, tenant_id=tenant_id, prompt=prompt_text,
+             output=content, tokens=tokens)
+    return resp
 
 
 def _extract_json(text: str) -> dict:
@@ -116,7 +179,7 @@ def _safe_get(d: dict, *keys, default: str = "用户未提供") -> str:
 # MCP 只读客户端：以 stdio 子进程拉起 mcp_file_server，调用 3 个只读工具
 # ===========================================================================
 class MCPFileClient:
-    """通过 stdio 连接独立 FastMCP 只读文件服务的客户端。"""
+    """通过 stdio 连接独立 FastMCP 只读文件服务的客户端（带超时/重试/日志）。"""
 
     def __init__(self) -> None:
         self._stdio_ctx = None
@@ -138,15 +201,29 @@ class MCPFileClient:
         await self._session.initialize()
         return self
 
-    async def call(self, tool_name: str, **kwargs) -> str:
-        """调用一个 MCP 只读工具，返回拼接后的文本结果。"""
-        result = await self._session.call_tool(tool_name, kwargs)
+    async def call(self, tool_name: str, *, tenant_id: str = "", **kwargs) -> str:
+        """调用一个 MCP 只读工具（超时 + 重试 + 日志），返回拼接后的文本结果。"""
+        label = f"mcp:{tool_name}"
+        timeout = float(os.getenv("MCP_TIMEOUT", "30"))
+
+        async def _do():
+            return await self._session.call_tool(tool_name, kwargs)
+
+        try:
+            result = await with_retry(
+                _do, retries=1, base_delay=1.0, timeout=timeout, label=label
+            )
+        except Exception as exc:  # noqa: BLE001
+            log_call(label, tenant_id=tenant_id, input_params=kwargs, error=str(exc))
+            raise
         parts: list[str] = []
         for block in result.content:
             text = getattr(block, "text", None)
             if text:
                 parts.append(text)
-        return "\n".join(parts)
+        out = "\n".join(parts)
+        log_call(label, tenant_id=tenant_id, input_params=kwargs, output=out)
+        return out
 
     async def __aexit__(self, *exc):
         try:
@@ -174,31 +251,42 @@ async def router_node(state: TicketState) -> dict:
     """意图路由：/diagnose 前缀硬路由；否则 LLM 识别；置信度 < 0.7 则 interrupt 反问。"""
     from langgraph.types import interrupt
 
+    tenant = resolve_tenant(state.get("tenant_id"))
     text = state.get("user_ticket_input", "")
     stripped = text.lstrip()
+    notes = list(state.get("degrade_notes", []))
+    call_count = int(state.get("call_count", 0))
 
     if stripped.startswith("/diagnose"):
         # 代码层硬路由：直接进入故障排查子图，不经过 LLM
         intent, conf, reason = "troubleshoot", 1.0, "命中 /diagnose 前缀，代码硬路由"
     else:
-        llm = get_llm()
-        resp = await llm.ainvoke([
-            {"role": "system", "content": ROUTER_PROMPT},
-            {"role": "user", "content": text[:2000]},
-        ])
-        raw = resp.content if isinstance(resp.content, str) else str(resp.content)
         try:
-            data = _extract_json(raw)
-        except Exception:
-            data = {}
-        intent = str(data.get("intent", "chat")).lower()
-        if intent not in ("troubleshoot", "chat", "code"):
-            intent = "chat"
-        try:
-            conf = float(data.get("confidence", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            conf = 0.0
-        reason = str(data.get("reason", ""))
+            resp = await _invoke_llm(
+                [
+                    {"role": "system", "content": ROUTER_PROMPT},
+                    {"role": "user", "content": text[:2000]},
+                ],
+                tenant_id=tenant,
+                component="router",
+            )
+            call_count += 1
+            raw = resp.content if isinstance(resp.content, str) else str(resp.content)
+            try:
+                data = _extract_json(raw)
+            except Exception:  # noqa: BLE001
+                data = {}
+            intent = str(data.get("intent", "chat")).lower()
+            if intent not in ("troubleshoot", "chat", "code"):
+                intent = "chat"
+            try:
+                conf = float(data.get("confidence", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                conf = 0.0
+            reason = str(data.get("reason", ""))
+        except Exception as exc:  # noqa: BLE001  LLM 失败降级
+            notes.append(f"路由 LLM 失败，降级为闲聊：{exc}")
+            intent, conf, reason = "chat", 0.5, f"LLM 路由失败降级：{exc}"
 
         # 低置信度 → 人在回路反问确认意图
         if conf < 0.7:
@@ -212,7 +300,13 @@ async def router_node(state: TicketState) -> dict:
             reason = f"用户已确认意图：{intent}"
 
     msg = f"路由完成：意图={intent}，置信度={conf:.2f}（{reason}）。"
-    return {"intent": intent, "intent_confidence": conf, "messages": [AIMessage(content=msg)]}
+    return {
+        "intent": intent,
+        "intent_confidence": conf,
+        "degrade_notes": notes,
+        "call_count": call_count,
+        "messages": [AIMessage(content=msg)],
+    }
 
 
 def route_after_router(state: TicketState) -> str:
@@ -224,15 +318,29 @@ def route_after_router(state: TicketState) -> str:
 # 节点 chat：闲聊 / 代码问答（不读本地文件、不调用任何工具）
 # ===========================================================================
 async def chat_respond_node(state: TicketState) -> dict:
-    llm = get_llm()
+    tenant = resolve_tenant(state.get("tenant_id"))
+    notes = list(state.get("degrade_notes", []))
     text = state.get("user_ticket_input", "")
-    resp = await llm.ainvoke([
-        {"role": "system", "content": CHAT_PROMPT},
-        {"role": "user", "content": text[:4000]},
-    ])
-    content = resp.content if isinstance(resp.content, str) else str(resp.content)
+    try:
+        resp = await _invoke_llm(
+            [
+                {"role": "system", "content": CHAT_PROMPT},
+                {"role": "user", "content": text[:4000]},
+            ],
+            tenant_id=tenant,
+            component="chat",
+        )
+        content = resp.content if isinstance(resp.content, str) else str(resp.content)
+    except Exception as exc:  # noqa: BLE001
+        content = (
+            f"（LLM 不可用，降级回复）我暂时无法响应：{exc}\n"
+            "如需排查故障，请用 `/diagnose` 开头描述故障现象。"
+        )
+        notes.append(f"闲聊 LLM 失败降级：{exc}")
     return {
         "final_report_markdown": content,
+        "degrade_notes": notes,
+        "call_count": int(state.get("call_count", 0)) + 1,
         "messages": [AIMessage(content="闲聊 / 代码问答已回复。")],
     }
 
@@ -244,21 +352,36 @@ async def parse_ticket_node(state: TicketState) -> dict:
     """解析原始工单为结构化字典，评估需要的数据源列表，并生成 order_id。"""
     from .persistence import new_order_id
 
+    tenant = resolve_tenant(state.get("tenant_id"))
+    notes = list(state.get("degrade_notes", []))
     ticket_text = state.get("user_ticket_input", "")
-    llm = get_llm()
-    resp = await llm.ainvoke([
-        {"role": "system", "content": PARSE_TICKET_PROMPT},
-        {"role": "user", "content": ticket_text},
-    ])
-    raw = resp.content if isinstance(resp.content, str) else str(resp.content)
 
     try:
-        data = _extract_json(raw)
-    except Exception:
+        resp = await _invoke_llm(
+            [
+                {"role": "system", "content": PARSE_TICKET_PROMPT},
+                {"role": "user", "content": ticket_text},
+            ],
+            tenant_id=tenant,
+            component="parse_ticket",
+        )
+        raw = resp.content if isinstance(resp.content, str) else str(resp.content)
+        call_inc = 1
+        try:
+            data = _extract_json(raw)
+        except Exception:  # noqa: BLE001  LLM 输出解析失败 → 兜底结构
+            notes.append("工单解析 LLM 输出非 JSON，使用兜底结构化结果。")
+            data = {
+                "parsed_ticket": {"phenomenon": ticket_text[:200]},
+                "need_data_source_list": list(DATA_SOURCES.keys()),
+            }
+    except Exception as exc:  # noqa: BLE001  LLM 调用失败 → 兜底
+        notes.append(f"工单解析 LLM 调用失败，使用兜底结果：{exc}")
         data = {
             "parsed_ticket": {"phenomenon": ticket_text[:200]},
             "need_data_source_list": list(DATA_SOURCES.keys()),
         }
+        call_inc = 0
 
     parsed_ticket = data.get("parsed_ticket", {}) or {}
     need_list = data.get("need_data_source_list", []) or []
@@ -279,6 +402,8 @@ async def parse_ticket_node(state: TicketState) -> dict:
         "parsed_ticket": parsed_ticket,
         "need_data_source_list": need_list,
         "order_id": order_id,
+        "degrade_notes": notes,
+        "call_count": int(state.get("call_count", 0)) + call_inc,
         "messages": [AIMessage(content=summary)],
     }
 
@@ -332,7 +457,7 @@ def request_user_authorize_node(state: TicketState) -> dict:
 
 
 # ===========================================================================
-# 节点 3：证据收集 Agent（仅对已授权数据源；知识库走 RAG）
+# 节点 3：证据收集 Agent（仅对已授权数据源；知识库走 RAG；按源降级）
 # ===========================================================================
 async def collect_evidence_node(state: TicketState) -> dict:
     """对 user_allow_list 内每个数据源收集证据。
@@ -340,8 +465,10 @@ async def collect_evidence_node(state: TicketState) -> dict:
     - knowledge_base：走 RAG 检索（两路召回 + RRF + cross-encoder），返回 Top5 片段；
     - 其余四类：调用 MCP 只读工具读取文件；
     - 被拒绝的数据源直接跳过；
+    - 单源失败仅降级该源（写 degrade_notes），不影响其他源；
     - 短期会话记忆缓存本轮 RAG 结果，避免重复检索。
     """
+    tenant = resolve_tenant(state.get("tenant_id"))
     allow_list = state.get("user_allow_list", [])
     deny_list = state.get("user_deny_list", [])
     evidence: dict[str, list[dict]] = {}
@@ -349,11 +476,13 @@ async def collect_evidence_node(state: TicketState) -> dict:
     rag_results: list = list(state.get("rag_results", []))
     rag_low_score: bool = bool(state.get("rag_low_score", False))
     parsed = state.get("parsed_ticket", {}) or {}
+    notes = list(state.get("degrade_notes", []))
 
     if not allow_list:
         return {
             "evidence": evidence,
             "session_memory": session_memory,
+            "degrade_notes": notes,
             "messages": [AIMessage(content="无任何数据源被授权，跳过证据收集。")],
         }
 
@@ -361,67 +490,87 @@ async def collect_evidence_node(state: TicketState) -> dict:
     if "knowledge_base" in allow_list:
         from .rag import build_rag_query, retrieve as rag_retrieve
         query = session_memory.get("rag_query") or build_rag_query(parsed) or state.get("user_ticket_input", "")
-        rag_out = rag_retrieve(query)
-        session_memory["rag_query"] = query
-        session_memory["rag_result"] = rag_out
-        rag_results = rag_out.get("chunks", [])
-        rag_low_score = rag_out.get("low_score", True)
-        evidence["knowledge_base"] = [
-            {
-                "file_path": c.get("source", ""),
-                "content": c.get("text", ""),
-                "score": c.get("score"),
-                "section": c.get("section", ""),
-            }
-            for c in rag_results
-        ]
-        print(
-            f"  [证据] 故障知识库（RAG）：召回 {len(rag_results)} 个片段，"
-            f"best_score={rag_out.get('best_score')}，low_score={rag_low_score}",
-            file=sys.stderr,
-        )
+        try:
+            rag_out = rag_retrieve(query, tenant_id=tenant)
+            session_memory["rag_query"] = query
+            session_memory["rag_result"] = rag_out
+            rag_results = rag_out.get("chunks", [])
+            rag_low_score = rag_out.get("low_score", True)
+            evidence["knowledge_base"] = [
+                {
+                    "file_path": c.get("source", ""),
+                    "content": c.get("text", ""),
+                    "score": c.get("score"),
+                    "section": c.get("section", ""),
+                }
+                for c in rag_results
+            ]
+            print(
+                f"  [证据] 故障知识库（RAG）：召回 {len(rag_results)} 个片段，"
+                f"best_score={rag_out.get('best_score')}，low_score={rag_low_score}",
+                file=sys.stderr,
+            )
+            if rag_out.get("reason"):
+                notes.append(f"知识库 RAG 降级：{rag_out.get('reason')}")
+        except Exception as exc:  # noqa: BLE001  RAG 整体失败降级
+            rag_low_score = True
+            notes.append(f"知识库 RAG 检索失败，已跳过：{exc}")
+            print(f"  [证据] 知识库 RAG 失败：{exc}", file=sys.stderr)
 
-    # —— 其余四类：MCP 只读 ——
+    # —— 其余四类：MCP 只读（按源降级）——
     mcp_sources = [s for s in allow_list if s != "knowledge_base"]
     keywords = _safe_get(parsed, "keywords", default="")
 
     if mcp_sources:
-        async with MCPFileClient() as mcp:
-            for src in mcp_sources:
-                base_rel = DATA_SOURCES[src]["base_dir"]
-                base_abs = REPO_ROOT / base_rel
-                label = DATA_SOURCES[src]["label"]
-
-                listing = await mcp.call("glob_list", base_dir=str(base_abs), pattern="**/*")
-                file_paths = [
-                    REPO_ROOT / line.strip()
-                    for line in listing.splitlines()
-                    if line.strip() and not line.startswith("[")
-                ][:MAX_FILES_PER_SOURCE]
-
-                collected: list[dict] = []
-                for fp in file_paths:
-                    content = await mcp.call("read_file", file_path=str(fp))
-                    collected.append({
-                        "file_path": str(fp.resolve().relative_to(REPO_ROOT.resolve())),
-                        "content": content,
-                    })
-
-                # 源码额外 grep 定位关键词行号
-                if src == "code" and keywords and keywords != "用户未提供":
-                    for fp in file_paths:
-                        grep_res = await mcp.call(
-                            "grep_search", pattern=re.escape(keywords), file_path=str(fp)
+        try:
+            async with MCPFileClient() as mcp:
+                for src in mcp_sources:
+                    base_rel = DATA_SOURCES[src]["base_dir"]
+                    base_abs = REPO_ROOT / base_rel
+                    label = DATA_SOURCES[src]["label"]
+                    try:
+                        listing = await mcp.call(
+                            "glob_list", tenant_id=tenant,
+                            base_dir=str(base_abs), pattern="**/*",
                         )
-                        if not grep_res.startswith("[") and not grep_res.startswith("无匹配"):
-                            rel = str(fp.resolve().relative_to(REPO_ROOT.resolve()))
-                            for item in collected:
-                                if item["file_path"] == rel:
-                                    item["grep_hits"] = grep_res
-                                    break
+                        file_paths = [
+                            REPO_ROOT / line.strip()
+                            for line in listing.splitlines()
+                            if line.strip() and not line.startswith("[")
+                        ][:MAX_FILES_PER_SOURCE]
 
-                evidence[src] = collected
-                print(f"  [证据] {label}：读取 {len(collected)} 个文件", file=sys.stderr)
+                        collected: list[dict] = []
+                        for fp in file_paths:
+                            content = await mcp.call(
+                                "read_file", tenant_id=tenant, file_path=str(fp),
+                            )
+                            collected.append({
+                                "file_path": str(fp.resolve().relative_to(REPO_ROOT.resolve())),
+                                "content": content,
+                            })
+
+                        # 源码额外 grep 定位关键词行号
+                        if src == "code" and keywords and keywords != "用户未提供":
+                            for fp in file_paths:
+                                grep_res = await mcp.call(
+                                    "grep_search", tenant_id=tenant,
+                                    pattern=re.escape(keywords), file_path=str(fp),
+                                )
+                                if not grep_res.startswith("[") and not grep_res.startswith("无匹配"):
+                                    rel = str(fp.resolve().relative_to(REPO_ROOT.resolve()))
+                                    for item in collected:
+                                        if item["file_path"] == rel:
+                                            item["grep_hits"] = grep_res
+                                            break
+
+                        evidence[src] = collected
+                        print(f"  [证据] {label}：读取 {len(collected)} 个文件", file=sys.stderr)
+                    except Exception as exc:  # noqa: BLE001  单源失败降级
+                        notes.append(f"{label} 证据收集失败，已跳过：{exc}")
+                        print(f"  [证据] {label} 失败：{exc}", file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001  MCP 子进程起不来
+            notes.append(f"MCP 文件服务不可用，全部本地源降级跳过：{exc}")
+            print(f"  [证据] MCP 不可用：{exc}", file=sys.stderr)
 
     denied_msg = (
         f"已跳过未授权数据源：{[DATA_SOURCES[k]['label'] for k in deny_list]}"
@@ -436,6 +585,7 @@ async def collect_evidence_node(state: TicketState) -> dict:
         "rag_results": rag_results,
         "rag_low_score": rag_low_score,
         "session_memory": session_memory,
+        "degrade_notes": notes,
         "messages": [AIMessage(content=msg)],
     }
 
@@ -444,8 +594,10 @@ async def collect_evidence_node(state: TicketState) -> dict:
 # 节点 4：故障诊断推理 Agent（含 RAG 约束 + 长期记忆参考）
 # ===========================================================================
 def _build_evidence_context(state: TicketState) -> str:
-    """把 state 内全部证据拼成 LLM 可读的上下文文本。"""
+    """把 state 内全部证据拼成 LLM 可读的上下文文本（含租户 + 长期记忆）。"""
+    tenant = resolve_tenant(state.get("tenant_id"))
     parts: list[str] = []
+    parts.append(f"【租户】{tenant}")
     parts.append("【用户原始工单输入】")
     parts.append(state.get("user_ticket_input", ""))
     parts.append("")
@@ -483,10 +635,10 @@ def _build_evidence_context(state: TicketState) -> str:
         parts.append("、".join(DATA_SOURCES[k]["label"] for k in deny_list))
         parts.append("")
 
-    # 长期记忆参考（仅提示，禁止复用根因）
+    # 长期记忆参考（仅提示，禁止复用根因）——带租户隔离
     try:
         from .persistence import load_long_term_memory
-        history = load_long_term_memory(limit=5)
+        history = load_long_term_memory(tenant_id=tenant, limit=5)
     except Exception:  # noqa: BLE001
         history = []
     if history:
@@ -503,20 +655,34 @@ def _build_evidence_context(state: TicketState) -> str:
 
 async def diagnosis_reason_node(state: TicketState) -> dict:
     """基于全部证据做根因推理，输出 diagnosis_result（根因/置信度/证据来源）。"""
+    tenant = resolve_tenant(state.get("tenant_id"))
+    notes = list(state.get("degrade_notes", []))
     context = _build_evidence_context(state)
-    llm = get_llm()
-    resp = await llm.ainvoke([
-        {"role": "system", "content": DIAGNOSIS_PROMPT},
-        {"role": "user", "content": context},
-    ])
-    raw = resp.content if isinstance(resp.content, str) else str(resp.content)
-
+    call_inc = 0
     try:
-        data = _extract_json(raw)
-    except Exception:
+        resp = await _invoke_llm(
+            [
+                {"role": "system", "content": DIAGNOSIS_PROMPT},
+                {"role": "user", "content": context},
+            ],
+            tenant_id=tenant,
+            component="diagnosis",
+        )
+        raw = resp.content if isinstance(resp.content, str) else str(resp.content)
+        call_inc = 1
+        try:
+            data = _extract_json(raw)
+        except Exception:  # noqa: BLE001
+            notes.append("诊断 LLM 输出非 JSON，使用降级结论。")
+            data = None
+    except Exception as exc:  # noqa: BLE001  LLM 调用失败 → 降级低置信结论
+        notes.append(f"诊断 LLM 调用失败，降级低置信结论：{exc}")
+        data = None
+
+    if not data:
         data = {
             "confidence": "低",
-            "root_cause_analysis": "诊断模型输出解析失败，无法给出可靠结论，请补充更多故障信息或开放更多授权。",
+            "root_cause_analysis": "诊断模型不可用或输出解析失败，无法给出可靠结论，请补充更多故障信息或开放更多授权。",
             "reproduce_verification": "证据不足，建议补充故障信息后重新分析。",
             "fix_suggestions": "⚠️【需人工执行】请补充更多故障信息后再给出修复建议。",
             "prevention_suggestions": "证据不足，暂无法给出预防建议。",
@@ -531,7 +697,12 @@ async def diagnosis_reason_node(state: TicketState) -> dict:
     data["fix_suggestions"] = _sanitize_fix(data["fix_suggestions"])
 
     msg = f"诊断推理完成，置信度：{data.get('confidence')}。"
-    return {"diagnosis_result": data, "messages": [AIMessage(content=msg)]}
+    return {
+        "diagnosis_result": data,
+        "degrade_notes": notes,
+        "call_count": int(state.get("call_count", 0)) + call_inc,
+        "messages": [AIMessage(content=msg)],
+    }
 
 
 # ===========================================================================
@@ -566,12 +737,13 @@ def _sanitize_fix(text: str) -> str:
 
 
 # ===========================================================================
-# 节点 5：报告生成 Agent（固定 Markdown 模板 + 知识库引用来源）
+# 节点 5：报告生成 Agent（固定 Markdown 模板 + 知识库引用来源 + 租户 + 降级）
 # ===========================================================================
 REPORT_TEMPLATE = """# 故障诊断报告
 
 ## 1. 故障概览
 工单编号：{order_id}
+租户：{tenant_id}
 故障现象：{phenomenon}
 故障客户端：{client}
 涉及服务：{service}
@@ -611,6 +783,7 @@ REPORT_TEMPLATE = """# 故障诊断报告
 本智能体仅作为工程师辅助排查参考，不能替代人工运维；
 部分信息源因为未授权没有参与分析，可能会遗漏故障点；证据不足请补充故障信息或者开放更多授权。
 {unauth_note}
+{degrade_block}
 """
 
 
@@ -664,6 +837,16 @@ def _format_rag_summary(state: TicketState) -> str:
     )
 
 
+def _format_degrade_block(notes: list) -> str:
+    """把降级记录渲染成报告段落（无降级则空串，保持报告整洁）。"""
+    if not notes:
+        return ""
+    lines = ["", "## 9. 工程边界降级说明", "本轮执行中发生以下降级（不影响主流程，已自动兜底）："]
+    for n in notes:
+        lines.append(f"- {n}")
+    return "\n".join(lines)
+
+
 def generate_report_node(state: TicketState) -> dict:
     """填充固定 Markdown 报告模板，生成 final_report_markdown。"""
     parsed = state.get("parsed_ticket", {}) or {}
@@ -671,6 +854,7 @@ def generate_report_node(state: TicketState) -> dict:
     deny_list = state.get("user_deny_list", [])
     evidence = state.get("evidence", {}) or {}
     diag = state.get("diagnosis_result", {}) or {}
+    notes = list(state.get("degrade_notes", []))
 
     authorized_summary = (
         "\n".join(f"- {DATA_SOURCES[k]['label']}" for k in allow_list)
@@ -687,6 +871,7 @@ def generate_report_node(state: TicketState) -> dict:
 
     report = REPORT_TEMPLATE.format(
         order_id=state.get("order_id", "（未生成）"),
+        tenant_id=resolve_tenant(state.get("tenant_id")),
         phenomenon=_safe_get(parsed, "phenomenon"),
         client=_safe_get(parsed, "client"),
         service=_safe_get(parsed, "service"),
@@ -703,6 +888,7 @@ def generate_report_node(state: TicketState) -> dict:
         fix_suggestions=diag.get("fix_suggestions", "⚠️【需人工执行】证据不足，暂无修复建议。"),
         prevention_suggestions=diag.get("prevention_suggestions", "证据不足，暂无法给出结论。"),
         unauth_note=unauth_note,
+        degrade_block=_format_degrade_block(notes),
     )
 
     return {
@@ -712,13 +898,20 @@ def generate_report_node(state: TicketState) -> dict:
 
 
 # ===========================================================================
-# 节点 6：工单持久化（序列化 state 关键内容 + 追加长期记忆）
+# 节点 6：工单持久化（MySQL 优先，失败降级 JSON）
 # ===========================================================================
 def persist_work_order_node(state: TicketState) -> dict:
-    """把本次诊断 state 关键内容序列化为 JSON 落盘，返回 order_id。"""
+    """把本次诊断 state 关键内容落库（MySQL 优先，失败降级 JSON），返回 order_id。"""
     from .persistence import save_work_order
-    order_id = save_work_order(state)
+    try:
+        order_id = save_work_order(state)
+        msg = f"工单已持久化：{order_id}"
+    except Exception as exc:  # noqa: BLE001  持久化失败不阻断报告已生成
+        order_id = state.get("order_id", "（未生成）")
+        msg = f"工单持久化失败（已降级）：{exc}"
+        log_call("persistence:save", tenant_id=resolve_tenant(state.get("tenant_id")),
+                 input_params={"order_id": order_id}, error=str(exc))
     return {
         "order_id": order_id,
-        "messages": [AIMessage(content=f"工单已持久化：{order_id}")],
+        "messages": [AIMessage(content=msg)],
     }
