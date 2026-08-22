@@ -2,6 +2,7 @@
 # SaaS 工单故障排查智能体 (LangGraph Demo) 依赖清单
 # 安装：pip install -r requirements.txt
 # 说明：本清单为依赖唯一来源，pyproject.toml 仅含工程元信息。
+# 基础设施（Milvus/MySQL/Redis）通过 docker-compose 拉起，见 README。
 # ============================================================
 
 # --- LangGraph 状态机 / DAG 工作流编排 ---
@@ -28,9 +29,20 @@ python-dotenv>=1.0.0
 # --- 数据校验（状态结构 / 结构化输出） ---
 pydantic>=2.0.0
 
-# --- RAG 知识库链路（轻量本地组件，不依赖 Elasticsearch / Milvus） ---
+# --- 向量库：Milvus（docker-compose 拉起 standalone） ---
+pymilvus>=2.4.0
+
+# --- 关系库：MySQL（工单持久化 + 长期记忆；无 DB 时降级 JSON） ---
+pymysql>=1.1.0
+
+# --- 缓存 / 限流：Redis（会话缓存 + LLM 限流；无 Redis 时进程内退化） ---
+redis>=5.0.0
+
+# --- 重试（LLM / 工具调用指数退避，可选：代码内已实现轻量重试，tenacity 作为备选） ---
+tenacity>=8.2.0
+
+# --- RAG 知识库链路（轻量本地组件） ---
 # 说明：sentence-transformers 会拉取 CPU 版 torch（体积较大），
 # 首次构建向量库时会下载 all-MiniLM-L6-v2 与 cross-encoder 模型。
-chromadb>=0.5.0
 rank-bm25>=0.2.2
 sentence-transformers>=3.0.0

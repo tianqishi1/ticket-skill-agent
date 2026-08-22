@@ -1,31 +1,37 @@
 """agent/rag.py
 ================
-故障知识库 RAG 链路（轻量本地组件，开箱即用，不依赖 Elasticsearch / Milvus）。
+故障知识库 RAG 链路（向量库 = Milvus；其余为轻量本地组件）。
 
 链路
 ----
 1. 加载 sample_data/knowledge_base/*.md，按 Markdown 标题语义分块
-   （chunk_size=800, overlap=150），每块携带 source 文件名元数据；
-2. 用 Chroma 持久化向量库（嵌入 = sentence-transformers all-MiniLM-L6-v2），
+   （chunk_size=800, overlap=150），每块携带 source 文件名 + tenant_id 元数据；
+2. Milvus 持久化向量库（嵌入 = sentence-transformers all-MiniLM-L6-v2，dim=384），
    支持 --rebuild-vector 重建；
 3. 检索 Query 由工单解析实体（service/keywords/phenomenon）组装，而非原始用户输入；
-4. 两路召回：rank_bm25 关键词 Top20 + 向量稠密 Top20；
+4. 两路召回：rank_bm25 关键词 Top20 + Milvus 向量稠密 Top20；
 5. RRF 融合排序；
 6. sentence-transformers cross-encoder 精排 → Top5；
 7. 相关性分数阈值 0.35，低于阈值标记 rag_low_score=True（知识库无高相关性匹配案例）。
 
-安全与授权
-----------
-- 向量库构建（离线）直接读取知识库文件；运行时 Agent 仅在「用户授权 knowledge_base」后
-  才执行检索，未授权直接跳过 RAG 链路。
+工程边界
+--------
+- 租户隔离：所有 Milvus 检索/查询都带 tenant_id 过滤（tenant_id in ["shared", <请求租户>]，
+  构建时统一写入 tenant_id="shared" 表示跨租户共享知识）；
+- 降级：Milvus 不可用 / 向量库未构建时，retrieve() 直接返回 low_score 结果，不抛异常；
+- 安全与授权：向量库构建（离线）直接读取知识库文件；运行时 Agent 仅在
+  「用户授权 knowledge_base」后才执行检索，未授权直接跳过 RAG 链路；
 - 所有返回片段携带 source 元数据，用于报告溯源，抑制大模型幻觉。
 """
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 from pathlib import Path
 from typing import Any
+
+from .infra import get_milvus, log_call
 
 # ---------------------------------------------------------------------------
 # 路径常量
@@ -34,8 +40,8 @@ from typing import Any
 LANGGRAPH_DEMO_DIR: Path = Path(__file__).resolve().parent.parent  # langgraph_demo/
 REPO_ROOT: Path = LANGGRAPH_DEMO_DIR.parent                        # ticket-skill-agent/
 KNOWLEDGE_BASE_DIR: Path = REPO_ROOT / "sample_data" / "knowledge_base"
-VECTOR_DB_DIR: Path = LANGGRAPH_DEMO_DIR / "vector_db"
 COLLECTION_NAME = "ticket_kb"
+EMBED_DIM = 384  # all-MiniLM-L6-v2 输出维度
 
 # 模型与超参
 EMBED_MODEL = "all-MiniLM-L6-v2"
@@ -47,8 +53,10 @@ VECTOR_TOP = 20
 RERANK_TOP = 5
 RRF_K = 60
 SCORE_THRESHOLD = 0.35
+# 构建时给所有共享知识库 chunk 打的租户标签（检索时与请求租户一起纳入过滤）
+SHARED_TENANT = "shared"
 
-# 模型单例（懒加载，避免 import 期拉起 torch / chroma）
+# 模型单例（懒加载，避免 import 期拉起 torch）
 _embedder = None
 _cross_encoder = None
 
@@ -108,7 +116,7 @@ def chunk_markdown(text: str, source: str) -> list[dict]:
 
 
 # ===========================================================================
-# 2. Chroma 向量库（手动计算嵌入，避免对 Chroma 内置 EF 的版本依赖）
+# 2. Milvus 向量库（手动计算嵌入，避免对内置 EF 的版本依赖）
 # ===========================================================================
 def _get_embedder():
     """懒加载 sentence-transformers 嵌入模型（单例）。"""
@@ -129,45 +137,88 @@ def _embed(texts: list[str]) -> list[list[float]]:
     return vecs.tolist()
 
 
-def _get_collection():
-    """获取 / 创建 Chroma 持久化 collection（手动喂入嵌入）。"""
-    import chromadb
-    client = chromadb.PersistentClient(path=str(VECTOR_DB_DIR))
-    return client.get_or_create_collection(
-        name=COLLECTION_NAME,
-        metadata={"hnsw:space": "cosine"},
-    )
+def _chunk_id(source: str, text: str) -> str:
+    """由 source + 文本哈希生成稳定 id（两路召回统一，供 RRF 去重）。"""
+    return f"{source}::{hashlib.md5((text or "")[:200].encode("utf-8")).hexdigest()[:8]}"
+
+
+def _ensure_collection(client) -> bool:
+    """幂等创建 Milvus collection（含 schema + 向量索引）。成功返回 True。"""
+    try:
+        if client.has_collection(COLLECTION_NAME):
+            return True
+        from pymilvus import DataType
+
+        schema = client.create_schema(auto_id=False, enable_dynamic_field=False)
+        schema.add_field("id", DataType.VARCHAR, max_length=128, is_primary=True)
+        schema.add_field("vector", DataType.FLOAT_VECTOR, dim=EMBED_DIM)
+        schema.add_field("text", DataType.VARCHAR, max_length=8192)
+        schema.add_field("source", DataType.VARCHAR, max_length=256)
+        schema.add_field("section", DataType.VARCHAR, max_length=256)
+        schema.add_field("tenant_id", DataType.VARCHAR, max_length=64)
+
+        index_params = client.prepare_index_params()
+        index_params.add_index(
+            field_name="vector", index_type="AUTOINDEX", metric_type="COSINE"
+        )
+        client.create_collection(
+            collection_name=COLLECTION_NAME,
+            schema=schema,
+            index_params=index_params,
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        log_call("rag:create_collection", error=str(exc))
+        return False
 
 
 def vector_store_ready() -> bool:
-    """向量库是否已构建（目录存在且非空）。"""
-    return VECTOR_DB_DIR.exists() and any(VECTOR_DB_DIR.iterdir())
-
-
-def _collection_count() -> int:
+    """向量库是否就绪（Milvus 可用 + collection 存在 + 有数据）。"""
+    client = get_milvus()
+    if client is None:
+        return False
     try:
-        return _get_collection().count()
-    except Exception:
+        if not client.has_collection(COLLECTION_NAME):
+            return False
+        return client.num_entities(COLLECTION_NAME) > 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def build_vector_store(
+    rebuild: bool = False, verbose: bool = True, tenant_id: str = SHARED_TENANT
+) -> int:
+    """构建（或重建）知识库 Milvus 向量库，返回入库 chunk 数。"""
+    client = get_milvus()
+    if client is None:
+        if verbose:
+            print("[RAG] Milvus 不可用，向量库构建跳过（知识库检索将降级）。")
         return 0
 
-
-def build_vector_store(rebuild: bool = False, verbose: bool = True) -> int:
-    """构建（或重建）知识库向量库，返回入库 chunk 数。"""
     if not KNOWLEDGE_BASE_DIR.exists():
         if verbose:
             print(f"[RAG] 知识库目录不存在：{KNOWLEDGE_BASE_DIR}")
         return 0
 
-    # 强制重建：先删除旧库
-    if rebuild and VECTOR_DB_DIR.exists():
-        import shutil
-        shutil.rmtree(VECTOR_DB_DIR)
+    # 强制重建：先删旧 collection
+    if rebuild:
+        try:
+            if client.has_collection(COLLECTION_NAME):
+                client.drop_collection(COLLECTION_NAME)
+        except Exception as exc:  # noqa: BLE001
+            log_call("rag:drop_collection", error=str(exc))
+
+    if not _ensure_collection(client):
+        if verbose:
+            print("[RAG] Milvus collection 创建失败，跳过构建。")
+        return 0
 
     # 已存在且非强制重建：跳过
-    if vector_store_ready() and not rebuild:
+    if not rebuild and vector_store_ready():
+        n = client.num_entities(COLLECTION_NAME)
         if verbose:
-            print(f"[RAG] 向量库已存在（{_collection_count()} chunk），跳过构建。")
-        return _collection_count()
+            print(f"[RAG] 向量库已存在（{n} entity），跳过构建。")
+        return int(n)
 
     md_files = sorted(KNOWLEDGE_BASE_DIR.rglob("*.md"))
     if not md_files:
@@ -187,20 +238,28 @@ def build_vector_store(rebuild: bool = False, verbose: bool = True) -> int:
     if not all_chunks:
         return 0
 
-    col = _get_collection()
-    # 分批嵌入，避免一次性内存峰值
+    # 分批嵌入并 upsert，避免一次性内存峰值
     batch = 64
+    inserted = 0
     for i in range(0, len(all_chunks), batch):
         batch_chunks = all_chunks[i:i + batch]
-        col.upsert(
-            ids=[c["id"] for c in batch_chunks],
-            documents=[c["text"] for c in batch_chunks],
-            metadatas=[{"source": c["source"], "section": c["section"]} for c in batch_chunks],
-            embeddings=_embed([c["text"] for c in batch_chunks]),
-        )
+        vecs = _embed([c["text"] for c in batch_chunks])
+        data = [
+            {
+                "id": _chunk_id(c["source"], c["text"]),
+                "vector": vecs[j],
+                "text": c["text"][:8192],
+                "source": c["source"],
+                "section": c["section"],
+                "tenant_id": tenant_id,
+            }
+            for j, c in enumerate(batch_chunks)
+        ]
+        client.upsert(collection_name=COLLECTION_NAME, data=data)
+        inserted += len(data)
     if verbose:
-        print(f"[RAG] 向量库构建完成：{len(md_files)} 文件 / {len(all_chunks)} chunk → {VECTOR_DB_DIR}")
-    return len(all_chunks)
+        print(f"[RAG] 向量库构建完成：{len(md_files)} 文件 / {inserted} chunk → Milvus[{COLLECTION_NAME}]")
+    return inserted
 
 
 # ===========================================================================
@@ -214,26 +273,43 @@ def _tokenize(text: str) -> list[str]:
     return [t.lower() for t in _TOKEN_RE.findall(text or "")]
 
 
-def _all_chunks_from_store() -> list[dict]:
-    """从 Chroma 取回全部 chunk（供 BM25 建索引）。"""
-    col = _get_collection()
-    got = col.get(include=["documents", "metadatas"])
+def _tenant_filter(tenant_id: str) -> str:
+    """构造 Milvus 过滤表达式：共享知识 + 当前租户。"""
+    t = (tenant_id or SHARED_TENANT).replace('"', "").strip() or SHARED_TENANT
+    return f'tenant_id in ["{SHARED_TENANT}", "{t}"]'
+
+
+def _all_chunks_from_store(tenant_id: str) -> list[dict]:
+    """从 Milvus 取回全部 chunk（供 BM25 建索引，带租户过滤）。"""
+    client = get_milvus()
+    if client is None:
+        return []
+    try:
+        rows = client.query(
+            collection_name=COLLECTION_NAME,
+            filter=_tenant_filter(tenant_id),
+            output_fields=["text", "source", "section"],
+            limit=10000,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log_call("rag:query_all", tenant_id=tenant_id, error=str(exc))
+        return []
     out: list[dict] = []
-    for cid, doc, meta in zip(
-        got.get("ids", []), got.get("documents", []), got.get("metadatas", [])
-    ):
-        meta = meta or {}
+    for row in rows or []:
+        text = row.get("text", "")
         out.append({
-            "id": cid, "text": doc,
-            "source": meta.get("source", ""), "section": meta.get("section", ""),
+            "id": _chunk_id(row.get("source", ""), text),
+            "text": text,
+            "source": row.get("source", ""),
+            "section": row.get("section", ""),
         })
     return out
 
 
-def _bm25_recall(query: str, k: int = BM25_TOP) -> list[dict]:
+def _bm25_recall(query: str, tenant_id: str, k: int = BM25_TOP) -> list[dict]:
     """rank_bm25 关键词召回 Top-K。"""
     from rank_bm25 import BM25Okapi
-    chunks = _all_chunks_from_store()
+    chunks = _all_chunks_from_store(tenant_id)
     if not chunks:
         return []
     corpus = [_tokenize(c["text"]) for c in chunks]
@@ -248,20 +324,34 @@ def _bm25_recall(query: str, k: int = BM25_TOP) -> list[dict]:
     return [c for c, _ in ranked]
 
 
-def _vector_recall(query: str, k: int = VECTOR_TOP) -> list[dict]:
-    """向量稠密召回 Top-K（手动计算 query 嵌入）。"""
-    col = _get_collection()
+def _vector_recall(query: str, tenant_id: str, k: int = VECTOR_TOP) -> list[dict]:
+    """Milvus 向量稠密召回 Top-K（手动计算 query 嵌入）。"""
+    client = get_milvus()
+    if client is None:
+        return []
     q_emb = _embed([query])
-    res = col.query(query_embeddings=q_emb, n_results=k, include=["documents", "metadatas"])
-    ids = (res.get("ids") or [[]])[0]
-    docs = (res.get("documents") or [[]])[0]
-    metas = (res.get("metadatas") or [[]])[0]
+    try:
+        res = client.search(
+            collection_name=COLLECTION_NAME,
+            data=[q_emb[0]] if q_emb else [[]],
+            filter=_tenant_filter(tenant_id),
+            limit=k,
+            output_fields=["text", "source", "section"],
+        )
+    except Exception as exc:  # noqa: BLE001
+        log_call("rag:vector_search", tenant_id=tenant_id, error=str(exc))
+        return []
     out: list[dict] = []
-    for i, (cid, doc, meta) in enumerate(zip(ids, docs, metas)):
-        meta = meta or {}
+    hits = (res or [[]])[0] if res else []
+    for i, hit in enumerate(hits):
+        entity = hit.get("entity", hit) if isinstance(hit, dict) else {}
+        text = entity.get("text", "")
         out.append({
-            "id": cid, "text": doc, "source": meta.get("source", ""),
-            "section": meta.get("section", ""), "vector_rank": i + 1,
+            "id": _chunk_id(entity.get("source", ""), text),
+            "text": text,
+            "source": entity.get("source", ""),
+            "section": entity.get("section", ""),
+            "vector_rank": i + 1,
         })
     return out
 
@@ -308,7 +398,7 @@ def _rerank(query: str, candidates: list[dict], top: int = RERANK_TOP) -> list[d
 # ===========================================================================
 # 6. 对外检索 API
 # ===========================================================================
-def retrieve(query: str) -> dict[str, Any]:
+def retrieve(query: str, tenant_id: str = SHARED_TENANT) -> dict[str, Any]:
     """两路召回 + RRF + cross-encoder 精排，返回 Top5 片段与 low_score 标记。
 
     返回结构：
@@ -323,14 +413,18 @@ def retrieve(query: str) -> dict[str, Any]:
     if not query or not query.strip():
         return {"query": query, "chunks": [], "low_score": True, "best_score": 0.0,
                 "reason": "查询为空"}
+    if get_milvus() is None:
+        return {"query": query, "chunks": [], "low_score": True, "best_score": 0.0,
+                "reason": "Milvus 不可用"}
     if not vector_store_ready():
         return {"query": query, "chunks": [], "low_score": True, "best_score": 0.0,
                 "reason": "向量库未构建"}
 
     try:
-        bm = _bm25_recall(query, BM25_TOP)
-        vec = _vector_recall(query, VECTOR_TOP)
+        bm = _bm25_recall(query, tenant_id, BM25_TOP)
+        vec = _vector_recall(query, tenant_id, VECTOR_TOP)
     except Exception as exc:  # noqa: BLE001
+        log_call("rag:recall", tenant_id=tenant_id, input_params={"query": query}, error=str(exc))
         return {"query": query, "chunks": [], "low_score": True, "best_score": 0.0,
                 "reason": f"召回失败：{exc}"}
 
